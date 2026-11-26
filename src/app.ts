@@ -587,6 +587,31 @@ function showSetup(): void {
 
 // ---------- locked view ----------
 
+/**
+ * Dead-end recovery for unlock failures. The vault-ready localStorage flag
+ * and the IndexedDB records can disagree (wipe that failed halfway, a
+ * biometric bootstrap that never persisted a secret, stale cached shell
+ * from an older deploy). Detect the mismatch and route to setup instead
+ * of stranding the user on the locked screen. Returns true when handled.
+ */
+function handleUnlockDeadEnd(err: string): boolean {
+  if (/not set up/i.test(err)) {
+    lsRemove(KEYS.vaultReady)
+    // showSetup() re-renders (and replaces the status element), so the
+    // message must be set after it, not before.
+    showSetup()
+    setStatus('Vault has no saved keys — creating a fresh one.')
+    return true
+  }
+  if (/not protected with a PIN/i.test(err)) {
+    setStatus(
+      'This vault was set up with biometrics only — use the biometric unlock.',
+    )
+    return true
+  }
+  return false
+}
+
 function showLocked(): void {
   resetRoot()
   if (!root) return
@@ -612,6 +637,8 @@ function showLocked(): void {
     pin.input.value = ''
     if (ok) {
       showMain()
+    } else if (err !== undefined && handleUnlockDeadEnd(err)) {
+      return
     } else {
       setStatus(err ?? 'Wrong PIN.')
       btn.disabled = false
@@ -636,6 +663,8 @@ function showLocked(): void {
         const { ok, err } = await vaultUnlockPrf()
         if (ok) {
           showMain()
+        } else if (err !== undefined && handleUnlockDeadEnd(err)) {
+          return
         } else {
           setStatus(err ?? 'Biometric unlock failed. Use your PIN.')
           bio.disabled = false
