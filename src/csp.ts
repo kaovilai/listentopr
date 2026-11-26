@@ -6,16 +6,37 @@
 // the served CSP. These helpers extract connect-src from the meta tag and
 // decide whether an endpoint origin passes it.
 
-/** Extract the connect-src directive value from a full CSP string. */
-export function connectSrcValue(csp: string): string | null {
+/** Extract a named directive's value from a full CSP string. */
+function directiveValue(csp: string, name: string): string | null {
   const directives = csp.split(';')
   for (const directive of directives) {
     const parts = directive.trim().split(/\s+/)
-    if (parts[0] === 'connect-src') {
+    if (parts[0] === name) {
       return parts.slice(1).join(' ')
     }
   }
   return null
+}
+
+/** Extract the connect-src directive value from a full CSP string. */
+export function connectSrcValue(csp: string): string | null {
+  return directiveValue(csp, 'connect-src')
+}
+
+/** Extract the style-src directive value from a full CSP string. */
+export function styleSrcValue(csp: string): string | null {
+  return directiveValue(csp, 'style-src')
+}
+
+/**
+ * True when style-src permits inline <style> elements. The app needs this:
+ * mermaid embeds an inline <style> in every rendered diagram SVG. Scripts
+ * stay strictly 'self' — this exception is styles only.
+ */
+export function styleSrcAllowsInline(csp: string): boolean {
+  const value = styleSrcValue(csp)
+  if (value === null) return false
+  return value.split(/\s+/).includes("'unsafe-inline'")
 }
 
 function endpointOrigin(endpoint: string): URL | null {

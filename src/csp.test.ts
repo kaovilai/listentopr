@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { connectSrcValue, endpointAllowedByConnectSrc } from './csp'
+import {
+  connectSrcValue,
+  endpointAllowedByConnectSrc,
+  styleSrcAllowsInline,
+  styleSrcValue,
+} from './csp'
 
 // The CSP this app ships (index.html), with the build-time LLM origin baked
-// in via VITE_LLM_ENDPOINT.
+// in via VITE_LLM_ENDPOINT. style-src carries 'unsafe-inline' because mermaid
+// embeds an inline <style> in every rendered diagram SVG; scripts stay strict.
 const SHIPPED_CSP =
-  "default-src 'self'; script-src 'self'; style-src 'self'; " +
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
   "img-src 'self' data: https:; " +
   "connect-src 'self' https://api.github.com https://github.com https://*.githubusercontent.com https://api.example.com; " +
   "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
@@ -18,6 +24,22 @@ describe('connectSrcValue', () => {
 
   it('returns null when there is no connect-src directive', () => {
     expect(connectSrcValue("default-src 'self'")).toBeNull()
+  })
+})
+
+describe('styleSrcAllowsInline', () => {
+  it('the shipped CSP allows inline styles (mermaid diagram <style> in SVG)', () => {
+    expect(styleSrcValue(SHIPPED_CSP)).toBe("'self' 'unsafe-inline'")
+    expect(styleSrcAllowsInline(SHIPPED_CSP)).toBe(true)
+  })
+
+  it('rejects a style-src without the inline exception', () => {
+    expect(styleSrcAllowsInline("style-src 'self'")).toBe(false)
+  })
+
+  it('returns false when there is no style-src directive', () => {
+    expect(styleSrcAllowsInline("default-src 'self'")).toBe(false)
+    expect(styleSrcValue("default-src 'self'")).toBeNull()
   })
 })
 

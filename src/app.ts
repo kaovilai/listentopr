@@ -23,6 +23,17 @@ import { createStore } from './store'
 import { createMediaSessionController, type MediaSessionController } from './mediasession'
 import { createKeyboardController, type KeyboardController } from './keyboard'
 import { createSleepTimer, type SleepTimer } from './sleeptimer'
+import {
+  createThemeController,
+  type ResolvedTheme,
+  type ThemeController,
+  type ThemeMode,
+} from './theme'
+import {
+  createDiagramRenderer,
+  type DiagramRenderAllEntry,
+  type DiagramRenderer,
+} from './diagrams'
 import type {
   LlmConfig,
   LlmProvider,
@@ -73,7 +84,6 @@ const KEYS = {
   visionModel: 'listentopr.llm-vision-model',
   prefs: 'listentopr.tts-prefs',
   wlDismissed: 'listentopr.wl-banner-dismissed',
-  theme: 'listentopr.theme',
 } as const
 
 const PROVIDERS: readonly LlmProvider[] = ['openai', 'anthropic', 'gemini']
@@ -125,13 +135,23 @@ let store: ReturnType<typeof createStore> | null = null
 let keyboard: KeyboardController | null = null
 let mediaSession: MediaSessionController | null = null
 let sleepTimer: SleepTimer | null = null
+let theme: ThemeController | null = null
+let diagrams: DiagramRenderer | null = null
+/** Resolved theme last pushed to the diagram renderer (skip no-op re-renders). */
+let lastDiagramTheme: ResolvedTheme | null = null
+/** Diagrams-section view state for the load in flight (see DiagramsView). */
+const diagramsView = createDiagramsView()
 
 let statusEl: HTMLElement | null = null
 const offlineBanner = el('div', 'banner banner-offline', 'Offline — check connection')
 offlineBanner.hidden = true
+offlineBanner.setAttribute('role', 'status')
+offlineBanner.setAttribute('aria-live', 'polite')
 
 const updateBanner = el('div', 'banner banner-warn', 'New version available')
 updateBanner.hidden = true
+updateBanner.setAttribute('role', 'status')
+updateBanner.setAttribute('aria-live', 'polite')
 {
   const reloadBtn = el('button', 'btn btn-small', 'Reload')
   reloadBtn.type = 'button'
@@ -320,18 +340,37 @@ const CSP_ENDPOINT_MSG =
 
 // ---------- theme ----------
 
-/** Persisted theme; 'dark' unless explicitly set to 'light'. */
-export function readTheme(): 'dark' | 'light' {
-  return lsGet(KEYS.theme) === 'light' ? 'light' : 'dark'
+/** Header toggle cycles auto -> light -> dark -> auto. */
+export function nextThemeMode(mode: ThemeMode): ThemeMode {
+  if (mode === 'auto') return 'light'
+  if (mode === 'light') return 'dark'
+  return 'auto'
 }
 
-/** Apply the persisted theme to <body> (variables live in styles.css). */
-function applyTheme(): void {
-  try {
-    document.body.classList.toggle('theme-light', readTheme() === 'light')
-  } catch {
-    // no body in this environment — nothing to theme
-  }
+/** Short button caption for a theme mode. */
+export function themeModeLabel(mode: ThemeMode): string {
+  if (mode === 'auto') return 'Auto'
+  if (mode === 'light') return 'Light'
+  return 'Dark'
+}
+
+/** Accessible button label; auto additionally says it follows the system. */
+export function themeModeAria(mode: ThemeMode): string {
+  return mode === 'auto'
+    ? 'Theme: Auto (follows system)'
+    : `Theme: ${themeModeLabel(mode)}`
+}
+
+// ---------- diagrams ----------
+
+/**
+ * True when the spoken section is the one that describes the PR's mermaid
+ * diagrams (the transcript's architecture section). Diagram cards highlight
+ * while it plays.
+ */
+export function diagramSectionSpoken(section: TranscriptSection | undefined): boolean {
+  if (!section) return false
+  return section.id === 'architecture' || /diagram|architecture/i.test(section.title)
 }
 
 // ---------- vault adapters ----------
@@ -397,6 +436,8 @@ function resetRoot(): void {
 function makeStatusEl(): HTMLElement {
   const s = el('div', 'banner banner-error')
   s.hidden = true
+  s.setAttribute('role', 'status')
+  s.setAttribute('aria-live', 'polite')
   statusEl = s
   return s
 }
@@ -645,20 +686,48 @@ function buildSettingsPanel(): HTMLDivElement {
 function setActiveSentence(si: number, i: number): void {
   if (!transcriptEl) return
   const prev = transcriptEl.querySelector('.sentence.active')
-  if (prev) prev.classList.remove('active')
+  if (prev) {
+    prev.classList.remove('active')
+    prev.removeAttribute('aria-current')
+  }
   const span = transcriptEl.querySelector(
     `.sentence[data-si="${Number(si)}"][data-i="${Number(i)}"]`,
   )
   if (span) {
     span.classList.add('active')
-    span.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    span.setAttribute('aria-current', 'true')
+    // Smooth scroll only when the user has not asked for reduced motion.
+    let reduced = false
+    try {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    } catch {
+      reduced = false
+    }
+    span.scrollIntoView({ block: 'nearest', behavior: reduced ? 'auto' : 'smooth' })
   }
+  updateDiagramHighlight(si)
 }
 
 function clearActiveSentence(): void {
   if (!transcriptEl) return
   const prev = transcriptEl.querySelector('.sentence.active')
-  if (prev) prev.classList.remove('active')
+  if (prev) {
+    prev.classList.remove('active')
+    prev.removeAttribute('aria-current')
+  }
+  clearDiagramHighlight()
+}
+
+/** Highlight diagram cards while the diagram-describing section is spoken. */
+function updateDiagramHighlight(sectionIndex: number): void {
+  const active = diagramSectionSpoken(streamSections[sectionIndex])
+  for (const card of diagramsView.cards()) {
+    card.classList.toggle('diagram-active', active)
+  }
+}
+
+function clearDiagramHighlight(): void {
+  for (const card of diagramsView.cards()) card.classList.remove('diagram-active')
 }
 
 function updateControlStates(state: TtsState): void {
@@ -669,6 +738,12 @@ function updateControlStates(state: TtsState): void {
   }
   if (pauseBtn) pauseBtn.disabled = !(state.playing && !state.paused)
   if (stopBtn) stopBtn.disabled = !(state.playing || state.paused) && !streamHolding
+}
+
+/** Human scrubber label ("0:45 of 3:10") for a position ratio of the total. */
+export function scrubberTimeLabel(ratio: number, totalSeconds: number): string {
+  const r = Math.min(1, Math.max(0, ratio))
+  return `${formatTime(r * totalSeconds)} of ${formatTime(totalSeconds)}`
 }
 
 /** Scrubber time label; reflects the pending (dragging) value while scrubbing. */
@@ -683,8 +758,10 @@ function updateScrubber(): void {
   const denom = Math.max(1, Number(scrubberRange.max))
   const v = Number(scrubberRange.value)
   const ratio = Math.min(1, Math.max(0, v / denom))
-  scrubberTime.textContent =
-    `${formatTime(ratio * p.totalEstimatedSeconds)} of ${formatTime(p.totalEstimatedSeconds)}`
+  const label = scrubberTimeLabel(ratio, p.totalEstimatedSeconds)
+  scrubberTime.textContent = label
+  // Screen readers hear the time context, not a bare "12 of 40" index.
+  scrubberRange.setAttribute('aria-valuetext', label)
 }
 
 /** Throttled resume-position persistence while playing. */
@@ -849,6 +926,86 @@ let streamResuming = false
 /** Bumped whenever the active stream is aborted; invalidates in-flight loads. */
 let loadToken = 0
 
+// ---------- diagrams section view ----------
+
+/**
+ * Diagrams-section view state for one load. Rendered entries can finish
+ * before the transcript title builds their container (a cached mermaid
+ * import resolves in microtasks; the load pipeline awaits macrotasks like
+ * vault/IDB reads): those entries are parked and flushed when the container
+ * is built, so no load loses its diagrams to a lost race.
+ */
+export interface DiagramsView {
+  /** True when the current load has mermaid blocks to show. */
+  hasBlocks(): boolean
+  /** Record the current load's mermaid blocks (the container is built later). */
+  setBlocks(blocks: string[]): void
+  /** Build the collapsible section rendered under the transcript title. */
+  buildContainer(): HTMLElement
+  /** Fill the container, or park the entries until buildContainer runs. */
+  deliver(entries: DiagramRenderAllEntry[]): void
+  /** Card elements of the current load, in block order. */
+  cards(): HTMLElement[]
+  /** Drop all state (new load / abort) so stale renders cannot repopulate. */
+  reset(): void
+}
+
+export function createDiagramsView(): DiagramsView {
+  let blocks: string[] = []
+  let cards: HTMLElement[] = []
+  let body: HTMLElement | null = null
+  /** Entries delivered before the container existed, waiting for it. */
+  let parked: DiagramRenderAllEntry[] | null = null
+
+  function fill(target: HTMLElement, entries: DiagramRenderAllEntry[]): void {
+    target.textContent = ''
+    cards = []
+    entries.forEach((entry, i) => {
+      const card = el('figure', 'diagram-card')
+      card.appendChild(el('figcaption', 'diagram-caption', `Diagram ${i + 1}`))
+      if (entry.result) {
+        card.appendChild(entry.result.element)
+      } else {
+        card.appendChild(el('p', 'diagram-error', 'Diagram could not be rendered'))
+        card.appendChild(el('pre', 'diagram-source', entry.block))
+      }
+      target.appendChild(card)
+      cards.push(card)
+    })
+  }
+
+  return {
+    hasBlocks: () => blocks.length > 0,
+    setBlocks(next) {
+      blocks = next
+    },
+    buildContainer() {
+      const details = el('details', 'diagrams')
+      details.appendChild(el('summary', 'diagrams-summary', 'Diagrams'))
+      const target = el('div', 'diagrams-body')
+      details.appendChild(target)
+      body = target
+      cards = []
+      if (parked !== null) {
+        fill(target, parked)
+        parked = null
+      }
+      return details
+    },
+    deliver(entries) {
+      if (body !== null) fill(body, entries)
+      else parked = entries
+    },
+    cards: () => cards,
+    reset() {
+      blocks = []
+      cards = []
+      body = null
+      parked = null
+    },
+  }
+}
+
 function abortActiveStream(): void {
   loadToken++
   if (stream !== null) {
@@ -859,14 +1016,42 @@ function abortActiveStream(): void {
   streamStarted = false
   streamHolding = false
   streamHoldFlatIndex = null
+  // Diagrams belong to the aborted load: drop cards and their handles so a
+  // stale renderAll cannot repopulate the view (loadToken guard below) and
+  // theme rerenders no longer touch discarded elements.
+  diagramsView.reset()
+  if (diagrams) diagrams.release()
 }
 
 function renderStreamTitle(title: string): void {
   if (!transcriptEl) return
   transcriptEl.textContent = ''
   transcriptEl.appendChild(el('h2', 'transcript-title', title))
+  if (diagramsView.hasBlocks()) {
+    transcriptEl.appendChild(diagramsView.buildContainer())
+  }
   transcriptEl.hidden = false
   if (actionsEl) actionsEl.hidden = false
+}
+
+/**
+ * Render one card per mermaid block into the current load's Diagrams section.
+ * Cached handles live in the renderer (theme rerender swaps elements in
+ * place); a superseded load (loadToken moved) discards the result. When the
+ * section container does not exist yet, the entries are parked inside the
+ * view and flushed when renderStreamTitle builds it.
+ */
+async function renderDiagramCards(blocks: string[], myLoad: number): Promise<void> {
+  diagramsView.setBlocks(blocks)
+  if (blocks.length === 0 || !diagrams) return
+  if (theme) {
+    const resolved = theme.getResolved()
+    lastDiagramTheme = resolved
+    await diagrams.setTheme(resolved)
+  }
+  const entries = await diagrams.renderAll(blocks)
+  if (myLoad !== loadToken) return // superseded by a newer load or abort
+  diagramsView.deliver(entries)
 }
 
 /** Append one section to the transcript view; indices match the tts queue. */
@@ -880,9 +1065,17 @@ function appendSectionToView(section: TranscriptSection): void {
     const span = el('span', 'sentence', sentence)
     span.dataset.si = String(si)
     span.dataset.i = String(i)
-    span.addEventListener('click', () => {
+    span.tabIndex = 0
+    const seekHere = () => {
       setActiveSentence(si, i)
       tts.seekTo(flatSentenceCursor(streamSections, si, i))
+    }
+    span.addEventListener('click', seekHere)
+    span.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        seekHere()
+      }
     })
     wrap.appendChild(span)
     wrap.appendChild(document.createTextNode(' '))
@@ -1311,6 +1504,7 @@ async function refreshQueueList(): Promise<void> {
     row.appendChild(el('span', 'queue-title', item.title))
     const rm = el('button', 'btn btn-small', 'Remove')
     rm.type = 'button'
+    rm.setAttribute('aria-label', `Remove ${item.title} from queue`)
     rm.addEventListener('click', () => {
       if (!store) return
       void store.removeFromQueue(item.ref).then(() => {
@@ -1453,12 +1647,21 @@ function showMain(): void {
   header.appendChild(el('h1', 'app-title', 'ListenToPR'))
   const headerActions = el('div', 'header-actions')
 
+  // Theme: tri-state cycle auto -> light -> dark, driven by the controller.
   const themeBtn = el('button', 'btn btn-secondary', 'Theme')
   themeBtn.type = 'button'
+  const syncThemeBtn = (): void => {
+    if (!theme) return
+    const mode = theme.getMode()
+    themeBtn.textContent = `Theme: ${themeModeLabel(mode)}`
+    themeBtn.setAttribute('aria-label', themeModeAria(mode))
+  }
   themeBtn.addEventListener('click', () => {
-    lsSet(KEYS.theme, readTheme() === 'dark' ? 'light' : 'dark')
-    applyTheme()
+    if (!theme) return
+    theme.setMode(nextThemeMode(theme.getMode()))
+    syncThemeBtn()
   })
+  syncThemeBtn()
 
   const settingsBtn = el('button', 'btn btn-secondary', 'Settings')
   settingsBtn.type = 'button'
@@ -1678,6 +1881,10 @@ async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<voi
     const headSha = pr.headSha ?? null
     currentHeadSha = headSha
     currentTitle = title
+    // Diagram cards for this load; renderStreamTitle builds their container
+    // later, and entries that finish first are parked until then (a newer
+    // load's loadToken still drops the whole result).
+    void renderDiagramCards(pr.mermaidBlocks, myLoad)
 
     const endpoint = lsGet(KEYS.endpoint) ?? ''
     const endpointOk = endpoint === '' || llmEndpointAllowed(endpoint)
@@ -1840,7 +2047,17 @@ function registerServiceWorker(): void {
 function init(): void {
   root = document.getElementById('app')
   if (!root) return
-  applyTheme()
+  theme = createThemeController()
+  theme.apply()
+  theme.listen()
+  theme.onChange((_mode, resolved) => {
+    // Re-render open diagram cards in the new mermaid theme; skip when the
+    // resolved theme did not change (e.g. auto -> explicit system match).
+    if (resolved === lastDiagramTheme) return
+    lastDiagramTheme = resolved
+    if (diagrams && diagramsView.cards().length > 0) void diagrams.setTheme(resolved)
+  })
+  diagrams = createDiagramRenderer()
   vault = new KeyVault()
   tts = createTtsController()
   wakeLock = createWakeLockController()

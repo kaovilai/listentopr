@@ -70,7 +70,11 @@ Node 20+ recommended.
 - **Zero plaintext persistence**: only `{ciphertext, iv, salt, method}` records
   are stored, in IndexedDB. Nothing readable at rest, no secret in logs.
 - **CSP**: `index.html` ships a strict Content-Security-Policy
-  (`default-src 'self'`, no inline scripts/styles, `frame-ancestors 'none'`).
+  (`default-src 'self'`, no inline scripts, `frame-ancestors 'none'`).
+  `style-src` is `'self' 'unsafe-inline'`: mermaid embeds an inline
+  `<style>` element inside every rendered diagram SVG, so inline styles must
+  be allowed for diagrams to display. This exception is styles only —
+  `script-src` stays `'self'` with no inline-script allowance.
   `connect-src` allows only `self`, the GitHub API hosts, and the configured
   LLM endpoint.
 - Token sanitization: errors thrown from GitHub fetching have the token
@@ -148,9 +152,16 @@ playing automatically. Routing lives in `src/app.ts`.
 - **Export/share** — "Copy transcript" (async clipboard with an
   execCommand fallback), "Download .txt" (Blob download named after the PR),
   and "Share" via the Web Share API where available.
-- **Theme** — a light/dark toggle in the header, persisted in
-  `listentopr.theme` (localStorage), dark by default. All theming lives in
-  `styles.css` variables; no inline styles.
+- **Theme** — a tri-state header button (**Auto → Light → Dark**) backed by
+  `src/theme.ts`: Auto follows the OS `prefers-color-scheme`, explicit modes
+  persist in `listentopr.theme` (localStorage). The resolved theme is written
+  to `<html data-theme>` and the `<meta name="theme-color">` browser-chrome
+  color; all colors live in `styles.css` tokens. Switching also re-renders
+  open diagrams in the matching mermaid theme. `prefers-reduced-motion`
+  disables all transitions/animations. See [Theme](#theme).
+- **Diagrams** — mermaid blocks found in the PR body/comments render as
+  diagram cards in a collapsible **Diagrams** section of the transcript.
+  See [Diagrams](#diagrams).
 
 ### iOS Shortcut recipe
 
@@ -168,6 +179,39 @@ The same `?pr=<url>` query parameter works from any app that can open a URL,
 not just iOS — the app parses and auto-loads it on launch. Note that
 share-sheet delivery of the URL requires the PWA to be installed to the home
 screen.
+
+## Diagrams
+
+When a PR contains mermaid code blocks (`src/github.ts`
+`extractMermaidBlocks`), the transcript view gets a collapsible
+**Diagrams** section (`src/diagrams.ts`, rendered with mermaid 12,
+`securityLevel: 'strict'`, lazy-loaded on first render so PRs without
+diagrams never download the bundle):
+
+- Each block renders as a card with the SVG sized to the transcript width.
+- A block that fails to parse shows its raw mermaid source in a `<pre>` with
+  a "Diagram could not be rendered" label; sibling cards still render.
+- While the spoken section describes the diagrams (the transcript's
+  architecture section, tracked via `tts.onChange`), the cards get a
+  highlight ring.
+- Switching the app theme re-renders the open cards in the matching mermaid
+  theme (dark/light). Rendered handles are cached per load and discarded on
+  a new load.
+
+## Theme
+
+`src/theme.ts` (`createThemeController`) owns the tri-state theme:
+
+| Mode | Behavior |
+| --- | --- |
+| Auto (default for new/unset/corrupt storage) | follows `prefers-color-scheme`, live-updates on OS change |
+| Light / Dark | explicit, persisted in `listentopr.theme` |
+
+The resolved theme is applied as `<html data-theme="light|dark">` (dark
+tokens are the `:root` default) and mirrored into
+`<meta name="theme-color">` (`#0e1116` dark / `#f6f7f9` light). Legacy
+`listentopr.theme` values from the old light/dark toggle map onto the new
+modes (`light` → Light, anything unknown → Auto).
 
 ## DVC sign-off matrix
 

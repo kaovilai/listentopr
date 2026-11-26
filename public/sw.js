@@ -1,12 +1,20 @@
 // ListenToPR service worker. The app (not this file) registers it.
 // Plain JS on purpose: no build step, no imports.
 
-const VERSION = 'v1'
+const VERSION = 'v2'
 const SHELL_CACHE = 'listentopr-shell-' + VERSION
 // Relative paths, resolved against the SW scope at install time so a scoped
 // deploy (https://host/listentopr/) precaches its own shell instead of the
 // site root ('/' would fetch the wrong page; '/index.html' would 404).
-const SHELL_ASSETS = ['.', './index.html', './manifest.webmanifest', './icon.svg']
+// theme-boot.js must be precached: it is a blocking <head> script, and a
+// network miss would delay first paint for every cached visit.
+const SHELL_ASSETS = [
+  '.',
+  './index.html',
+  './theme-boot.js',
+  './manifest.webmanifest',
+  './icon.svg',
+]
 
 function shellUrls() {
   return SHELL_ASSETS.map((p) => new URL(p, self.registration.scope).href)

@@ -2,6 +2,7 @@
 // app.ts renders DOM at import; the module is imported against stubbed
 // document/window globals (init() exits early: no #app element).
 import { describe, it, expect, vi, beforeAll } from 'vitest'
+import type { DiagramRenderAllEntry } from './diagrams'
 
 function fakeElement(): any {
   return {
@@ -225,6 +226,86 @@ describe('formatTime', () => {
   })
 })
 
+describe('scrubberTimeLabel', () => {
+  it('labels a ratio of the total as "m:ss of m:ss"', () => {
+    expect(app.scrubberTimeLabel(0, 190)).toBe('0:00 of 3:10')
+    expect(app.scrubberTimeLabel(0.5, 190)).toBe('1:35 of 3:10')
+    expect(app.scrubberTimeLabel(1, 190)).toBe('3:10 of 3:10')
+  })
+
+  it('clamps the ratio into [0, 1]', () => {
+    expect(app.scrubberTimeLabel(-1, 100)).toBe('0:00 of 1:40')
+    expect(app.scrubberTimeLabel(2, 100)).toBe('1:40 of 1:40')
+    expect(app.scrubberTimeLabel(Number.NaN, 100)).toBe('0:00 of 1:40')
+  })
+})
+
+describe('createDiagramsView', () => {
+  const entry = (block: string, ok: boolean): DiagramRenderAllEntry => ({
+    block,
+    result: ok
+      ? {
+          element: fakeElement() as unknown as SVGElement,
+          rerender: async () => {},
+        }
+      : null,
+  })
+
+  it('hasBlocks reflects the recorded blocks of the current load', () => {
+    const view = app.createDiagramsView()
+    expect(view.hasBlocks()).toBe(false)
+    view.setBlocks(['graph TD; A-->B'])
+    expect(view.hasBlocks()).toBe(true)
+    view.reset()
+    expect(view.hasBlocks()).toBe(false)
+  })
+
+  it('parks entries delivered before the container exists and flushes them on build', () => {
+    const view = app.createDiagramsView()
+    view.setBlocks(['graph TD; A-->B', 'graph BROKEN'])
+    // renderAll finished before renderStreamTitle built the section.
+    view.deliver([entry('graph TD; A-->B', true), entry('graph BROKEN', false)])
+    expect(view.cards()).toHaveLength(0)
+
+    const container = view.buildContainer()
+    expect(view.cards()).toHaveLength(2)
+    // Cards landed inside the section body, in block order.
+    const body = (container as any).children[1]
+    expect(body.children).toHaveLength(2)
+    expect(body.children[0].children).toHaveLength(2) // caption + svg
+    // Failed block still gets a card (caption + error text + source).
+    expect(body.children[1].children).toHaveLength(3)
+  })
+
+  it('fills immediately when the container already exists', () => {
+    const view = app.createDiagramsView()
+    view.setBlocks(['graph TD; A-->B'])
+    view.buildContainer()
+    view.deliver([entry('graph TD; A-->B', true)])
+    expect(view.cards()).toHaveLength(1)
+  })
+
+  it('reset drops parked entries so a stale render cannot repopulate the view', () => {
+    const view = app.createDiagramsView()
+    view.setBlocks(['graph TD; A-->B'])
+    view.deliver([entry('graph TD; A-->B', true)])
+    view.reset()
+    view.buildContainer()
+    expect(view.cards()).toHaveLength(0)
+  })
+
+  it('a second build starts a fresh body; reset clears cards and parked state', () => {
+    const view = app.createDiagramsView()
+    view.setBlocks(['graph TD; A-->B'])
+    view.buildContainer()
+    view.deliver([entry('graph TD; A-->B', true)])
+    expect(view.cards()).toHaveLength(1)
+    const second = view.buildContainer()
+    expect(view.cards()).toHaveLength(0)
+    expect((second as any).children[1].children).toHaveLength(0)
+  })
+})
+
 describe('describeResumePosition', () => {
   const sections = [
     section(['a', 'b', 'c']),
@@ -296,19 +377,41 @@ describe('transcriptToText', () => {
   })
 })
 
-describe('readTheme', () => {
-  it('defaults to dark when nothing is persisted', () => {
-    storage.delete('listentopr.theme')
-    expect(app.readTheme()).toBe('dark')
+describe('nextThemeMode', () => {
+  it('cycles auto -> light -> dark -> auto', () => {
+    expect(app.nextThemeMode('auto')).toBe('light')
+    expect(app.nextThemeMode('light')).toBe('dark')
+    expect(app.nextThemeMode('dark')).toBe('auto')
+  })
+})
+
+describe('themeModeLabel / themeModeAria', () => {
+  it('labels each mode', () => {
+    expect(app.themeModeLabel('auto')).toBe('Auto')
+    expect(app.themeModeLabel('light')).toBe('Light')
+    expect(app.themeModeLabel('dark')).toBe('Dark')
   })
 
-  it('returns the persisted light theme', () => {
-    storage.set('listentopr.theme', 'light')
-    expect(app.readTheme()).toBe('light')
+  it('the auto label says it follows the system', () => {
+    expect(app.themeModeAria('auto')).toBe('Theme: Auto (follows system)')
+    expect(app.themeModeAria('light')).toBe('Theme: Light')
+    expect(app.themeModeAria('dark')).toBe('Theme: Dark')
+  })
+})
+
+describe('diagramSectionSpoken', () => {
+  it('is true for the architecture section id', () => {
+    expect(app.diagramSectionSpoken({ id: 'architecture', title: 'Anything', sentences: [] })).toBe(true)
   })
 
-  it('treats a bogus persisted value as dark', () => {
-    storage.set('listentopr.theme', 'blue')
-    expect(app.readTheme()).toBe('dark')
+  it('is true for titles mentioning diagrams or architecture', () => {
+    expect(app.diagramSectionSpoken({ id: 'x', title: 'Architecture and Diagrams', sentences: [] })).toBe(true)
+    expect(app.diagramSectionSpoken({ id: 'x', title: 'System diagrams', sentences: [] })).toBe(true)
+  })
+
+  it('is false for other sections and missing input', () => {
+    expect(app.diagramSectionSpoken({ id: 'overview', title: 'Overview', sentences: [] })).toBe(false)
+    expect(app.diagramSectionSpoken({ id: 'changes', title: 'Key Changes', sentences: [] })).toBe(false)
+    expect(app.diagramSectionSpoken(undefined)).toBe(false)
   })
 })

@@ -4,10 +4,19 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="referrer" content="no-referrer" />
+    <!-- style-src needs 'unsafe-inline': mermaid embeds an inline <style>
+         element in every rendered diagram SVG. Styles only — script-src
+         stays 'self' with no inline script exceptions. src/theme.ts keeps
+         this meta's content in sync with the active theme. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self' https://api.github.com https://github.com https://*.githubusercontent.com __CSP_LLM_ENDPOINT__; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://api.github.com https://github.com https://*.githubusercontent.com __CSP_LLM_ENDPOINT__; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     />
+    <meta name="theme-color" content="#0e1116" />
+    <!-- Blocking same-origin script resolves the theme before first paint
+         (CSP forbids inline script). Mirrors src/theme.ts defaults; the app
+         module reconciles via theme.apply() once it runs. -->
+    <script src="./theme-boot.js"></script>
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <title>ListenToPR</title>
