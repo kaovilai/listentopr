@@ -16,3 +16,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npm run build
+      # Guard: the app must ship CSS — a lost './styles.css' import once
+      # deployed an unstyled white page that passed every unit test.
+      - run: |
+          sh -c 'ls dist/assets/*.css >/dev/null || { echo "no CSS in build — styles.css import lost?"; exit 1; }'

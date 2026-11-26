@@ -1,6 +1,7 @@
 // ListenToPR app shell. Plain DOM, CSP-safe: no inline scripts, no inline
 // style attributes; all styling comes from styles.css classes.
 // contract says class KeyVault; sibling currently exports it as Vault
+import './styles.css'
 import { Vault as KeyVault, isPrfSupported } from './vault'
 import {
   parsePrInput,
