@@ -105,6 +105,35 @@ VITE_LLM_ENDPOINT=https://api.example.com npm run build
 placeholder when unset). A custom endpoint must match the selected provider's
 API dialect.
 
+## Context budget
+
+The **Settings → Advanced** area controls how much of the model's context
+window each transcript-generation call may use. The three settings are
+persisted in localStorage (`listentopr.llm-context`); invalid or corrupt
+values are ignored, and leaving all three unset keeps the classic fixed
+batching (10 files per call):
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| Context window (tokens) | `128000` | The model's context window. Batches are sized from it: fat windows get fat batches, small windows shrink them. |
+| Max per call (tokens) | `200000` | Hard cap on input tokens per LLM call (effectively the smaller of this and the context window). |
+| Single-shot when it fits | off | When the whole PR (description, comments, reviews, every patch) fits the window, generate the entire transcript in one call instead of section-by-section batches. The status line notes "Generating in a single pass." when it fires. |
+
+**Why 200k per call instead of the full window?** Prompts that fill the
+entire window are slower to start generating — the first section, and with it
+the first audio, arrives later — and models recall content buried in the
+middle of a huge prompt less reliably than content in tighter, rolling
+summaries. Capping each call keeps time-to-first-audio low and per-section
+quality high; the section pipeline (rolling summaries, prefetch) keeps the
+listening experience continuous regardless.
+
+**Overflow protection.** Every budgeted call is pre-checked against the
+per-call cap: oversized batches are binary-split into smaller ones, a single
+file whose patch cannot fit is truncated with a `(truncated)` marker (the
+prompt tells the model to cover only the visible part), and a final clamp
+hard-caps every user prompt — no request ever exceeds the per-call budget.
+Single-shot that does not fit silently falls back to sectioned batches.
+
 ## Share target usage
 
 Once installed as a PWA, the OS "share" sheet can send a PR link to ListenToPR

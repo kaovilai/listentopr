@@ -7,6 +7,7 @@ import type {
   PrFile,
   PullRequestData,
   Transcript,
+  TranscriptBudget,
   TranscriptSection,
   TranscriptStream,
 } from './types'
@@ -14,6 +15,124 @@ import type {
 export interface BuildTranscriptOptions {
   /** Resolved data URLs mapping index-wise to pr.imageUrls. */
   imageDataUrls?: string[]
+  /** Context-window budget for prompt sizing/truncation. */
+  budget?: TranscriptBudget
+}
+
+// ---------------------------------------------------------------------------
+// Context-window budgeting
+// ---------------------------------------------------------------------------
+
+export interface ResolvedBudget {
+  contextTokens: number
+  maxContextPerCall: number
+  singleShot: boolean
+}
+
+/** Rough token estimate: ~4 characters per token. */
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4)
+}
+
+/** Clamp v into [lo, hi]; non-finite or missing values fall back to `fallback`. */
+function clampInt(
+  v: number | undefined,
+  lo: number,
+  hi: number,
+  fallback: number,
+): number {
+  const n = typeof v === 'number' && Number.isFinite(v) ? v : fallback
+  return Math.min(hi, Math.max(lo, Math.round(n)))
+}
+
+const DEFAULT_CONTEXT_TOKENS = 128000
+const DEFAULT_MAX_CONTEXT_PER_CALL = 200000
+const MIN_CONTEXT_TOKENS = 8000
+const MAX_CONTEXT_TOKENS = 2000000
+const MIN_MAX_CONTEXT_PER_CALL = 2000
+const MAX_MAX_CONTEXT_PER_CALL = 2000000
+
+/**
+ * Resolve a TranscriptBudget: defaults 128000/200000/false; contextTokens
+ * clamped to 8000..2000000 and maxContextPerCall to 2000..2000000; then
+ * maxContextPerCall = min(maxContextPerCall, contextTokens) (applied after
+ * the defaults, so the resolved default pair is 128000/128000).
+ */
+export function resolveBudget(budget?: TranscriptBudget): ResolvedBudget {
+  const contextTokens = clampInt(
+    budget?.contextTokens,
+    MIN_CONTEXT_TOKENS,
+    MAX_CONTEXT_TOKENS,
+    DEFAULT_CONTEXT_TOKENS,
+  )
+  const maxContextPerCall = Math.min(
+    clampInt(
+      budget?.maxContextPerCall,
+      MIN_MAX_CONTEXT_PER_CALL,
+      MAX_MAX_CONTEXT_PER_CALL,
+      DEFAULT_MAX_CONTEXT_PER_CALL,
+    ),
+    contextTokens,
+  )
+  return { contextTokens, maxContextPerCall, singleShot: budget?.singleShot ?? false }
+}
+
+/** Response tokens reserved on top of the system prompt for every call. */
+const RESPONSE_ALLOWANCE = 4096
+/** Floor for the user-prompt token budget so tiny windows still send a usable prompt. */
+const MIN_USER_TOKENS = 512
+/** Upper bound on files per batch when a budget is present. */
+const MAX_FILES_PER_BATCH = 50
+/** Rolling-summary tokens reserved per earlier section when sizing batches. */
+const SUMMARY_TOKENS = 120
+
+/**
+ * User-prompt tokens allowed for one call: per-call budget minus the call's
+ * system prompt and the response allowance, floored at MIN_USER_TOKENS.
+ */
+function userPromptBudget(resolved: ResolvedBudget, systemText: string): number {
+  return Math.max(
+    MIN_USER_TOKENS,
+    resolved.maxContextPerCall - estimateTokens(systemText) - RESPONSE_ALLOWANCE,
+  )
+}
+
+/**
+ * Conservative per-image token cost: providers bill attached images as
+ * hundreds-to-thousands of tokens each (dimension- and provider-dependent),
+ * regardless of the base64 payload size.
+ */
+export const IMAGE_TOKEN_ESTIMATE = 1600
+
+/** Estimated tokens the images attached to a message list add to the call. */
+function imageTokens(images: string[]): number {
+  return images.length * IMAGE_TOKEN_ESTIMATE
+}
+
+/**
+ * Images that fit a call's user-prompt budget, plus the text budget left
+ * after their estimated cost. Images are dropped (empty array, full text
+ * budget back) when their cost alone would leave less than MIN_USER_TOKENS
+ * of text room, so images are never attached on top of an already-maxed
+ * text prompt.
+ */
+function fitImages(
+  resolved: ResolvedBudget,
+  systemText: string,
+  images: string[],
+): { images: string[]; textBudget: number } {
+  const base = userPromptBudget(resolved, systemText)
+  if (images.length === 0) return { images, textBudget: base }
+  const cost = imageTokens(images)
+  if (base - cost < MIN_USER_TOKENS) return { images: [], textBudget: base }
+  return { images, textBudget: base - cost }
+}
+
+/** Hard cap a prompt to a token budget, appending a '(truncated)' marker when cut. */
+function clampPromptToTokens(text: string, maxTokens: number): string {
+  if (estimateTokens(text) <= maxTokens) return text
+  const keep = Math.max(0, (maxTokens - 4) * 4)
+  return `${text.slice(0, keep)}\n(truncated)`
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +293,11 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n[truncated]`
 }
 
-function buildUserPrompt(pr: PullRequestData, imageCount: number): string {
+function buildUserPrompt(
+  pr: PullRequestData,
+  imageCount: number,
+  maxFiles = 40,
+): string {
   const lines: string[] = []
   lines.push(`Pull request: ${pr.ref.owner}/${pr.ref.repo}#${pr.ref.number}`)
   lines.push(`Title: ${pr.title}`)
@@ -184,7 +307,7 @@ function buildUserPrompt(pr: PullRequestData, imageCount: number): string {
   )
   lines.push('', '## Description', truncate(pr.body || '(no description)', 6000))
   lines.push('', '## Changed files')
-  for (const f of pr.files.slice(0, 40)) {
+  for (const f of pr.files.slice(0, maxFiles)) {
     lines.push(`- ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})`)
     if (f.patch) lines.push(truncate(f.patch, 1200))
   }
@@ -300,6 +423,7 @@ function materializeTranscript(raw: string, pr: PullRequestData): Transcript {
 /**
  * Build a speakable transcript for a PR via the LLM.
  * Images: opts.imageDataUrls map index-wise to pr.imageUrls (caller pre-resolves).
+ * Budget: when present, the user prompt is clamped to the per-call budget.
  */
 export async function buildTranscript(
   config: LlmConfig,
@@ -312,12 +436,26 @@ export async function buildTranscript(
     const dataUrl = imageDataUrls[i]
     if (typeof dataUrl === 'string' && dataUrl.length > 0) images.push(dataUrl)
   }
+  let attached = images
+  let userText = buildUserPrompt(pr, attached.length)
+  if (opts.budget !== undefined) {
+    // Image cost counts against the user-prompt budget: kept images shrink
+    // the text budget; images that cannot fit are dropped and the prompt
+    // says they could not be loaded.
+    const fit = fitImages(resolveBudget(opts.budget), SYSTEM_PROMPT, images)
+    attached = fit.images
+    userText = buildUserPrompt(pr, attached.length)
+    if (attached.length === 0 && pr.imageUrls.length > 0) {
+      userText += `\n${pr.imageUrls.length} image(s) were referenced but could not be loaded.`
+    }
+    userText = clampPromptToTokens(userText, fit.textBudget)
+  }
   const messages: LlmMessage[] = [
     { role: 'system', text: SYSTEM_PROMPT },
     {
       role: 'user',
-      text: buildUserPrompt(pr, images.length),
-      images: images.length > 0 ? images : undefined,
+      text: userText,
+      images: attached.length > 0 ? attached : undefined,
     },
   ]
   const raw = await chat(config, messages)
@@ -331,6 +469,8 @@ export async function buildTranscript(
 export interface DeltaSectionOptions {
   /** Injectable chat fn (tests). Defaults to the real LLM client. */
   chat?: typeof chat
+  /** Context-window budget: clamps the delta prompt to the per-call budget. */
+  budget?: TranscriptBudget
 }
 
 const DELTA_SYSTEM_PROMPT = [
@@ -377,9 +517,16 @@ export async function buildDeltaSection(
   opts: DeltaSectionOptions = {},
 ): Promise<TranscriptSection> {
   const chatFn = opts.chat ?? chat
+  let userText = deltaUserPrompt(pr, newCommits, previousSummary)
+  if (opts.budget !== undefined) {
+    userText = clampPromptToTokens(
+      userText,
+      userPromptBudget(resolveBudget(opts.budget), DELTA_SYSTEM_PROMPT),
+    )
+  }
   const messages: LlmMessage[] = [
     { role: 'system', text: DELTA_SYSTEM_PROMPT },
-    { role: 'user', text: deltaUserPrompt(pr, newCommits, previousSummary) },
+    { role: 'user', text: userText },
   ]
   const raw = await chatFn(config, messages)
   const parsed = extractJsonObject(raw)
@@ -409,6 +556,8 @@ export interface TranscriptStreamOptions {
   imageDataUrls?: string[]
   /** Injectable chat fn (tests). Defaults to the real LLM client. */
   chat?: typeof chat
+  /** Context-window budget: batch sizing, overflow pre-checks, single-shot. */
+  budget?: TranscriptBudget
 }
 
 /** TranscriptStream plus the next() cursor callers drive directly. */
@@ -420,8 +569,9 @@ export interface TranscriptStreamHandle extends TranscriptStream {
 type SectionSpec =
   | { kind: 'overview' }
   | { kind: 'architecture' }
-  | { kind: 'changes'; batch: number; files: PrFile[] }
+  | { kind: 'changes'; files: PrFile[] }
   | { kind: 'review-notes' }
+  | { kind: 'single-shot' }
 
 interface Generated {
   section: TranscriptSection
@@ -433,10 +583,10 @@ const BIG_PATCH_CHARS = 4000
 const FILES_PER_BATCH = 10
 
 /**
- * Split files into LLM batches: small files coalesce up to FILES_PER_BATCH;
+ * Split files into LLM batches: small files coalesce up to perBatch;
  * a file whose patch exceeds BIG_PATCH_CHARS gets a batch of its own.
  */
-function batchFiles(files: PrFile[]): PrFile[][] {
+function batchFiles(files: PrFile[], perBatch: number = FILES_PER_BATCH): PrFile[][] {
   const batches: PrFile[][] = []
   let current: PrFile[] = []
   const flush = (): void => {
@@ -451,37 +601,36 @@ function batchFiles(files: PrFile[]): PrFile[][] {
       batches.push([f])
     } else {
       current.push(f)
-      if (current.length >= FILES_PER_BATCH) flush()
+      if (current.length >= perBatch) flush()
     }
   }
   flush()
   return batches
 }
 
-function sectionId(spec: SectionSpec): string {
-  switch (spec.kind) {
-    case 'overview':
-      return 'overview'
-    case 'architecture':
-      return 'architecture'
-    case 'changes':
-      return `changes-${spec.batch}`
-    case 'review-notes':
-      return 'review-notes'
-  }
+/** Tokens one file contributes to a changes prompt (line + 1200-char-capped patch). */
+function filePromptTokens(f: PrFile): number {
+  const line = `- ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})`
+  return estimateTokens(line) + (f.patch ? estimateTokens(truncate(f.patch, 1200)) : 0)
 }
 
-function sectionTitle(spec: SectionSpec): string {
-  switch (spec.kind) {
-    case 'overview':
-      return 'Overview'
-    case 'architecture':
-      return 'Architecture and Diagrams'
-    case 'changes':
-      return `Key Changes (${spec.batch})`
-    case 'review-notes':
-      return 'Review Notes'
-  }
+/**
+ * Budget-aware files-per-batch:
+ * clamp(floor((maxContextPerCall - overhead - summaryCarry) / avgBatchFileTokens), 1, 50),
+ * where overhead is the changes-call system prompt + response allowance and
+ * summaryCarry reserves SUMMARY_TOKENS per section expected before the last batch.
+ */
+function filesPerBatchFor(files: PrFile[], resolved: ResolvedBudget): number {
+  if (files.length === 0) return FILES_PER_BATCH
+  const overhead = estimateTokens(systemTextForChanges()) + RESPONSE_ALLOWANCE
+  const expectedBatches = Math.max(1, Math.ceil(files.length / FILES_PER_BATCH))
+  const summaryCarry = SUMMARY_TOKENS * (2 + expectedBatches)
+  const avg = Math.max(
+    1,
+    files.reduce((sum, f) => sum + filePromptTokens(f), 0) / files.length,
+  )
+  const room = resolved.maxContextPerCall - overhead - summaryCarry
+  return Math.min(MAX_FILES_PER_BATCH, Math.max(1, Math.floor(room / avg)))
 }
 
 const STREAM_SYSTEM_BASE = [
@@ -494,7 +643,10 @@ const STREAM_SYSTEM_BASE = [
   'Every sentence must be self-contained and natural when read aloud by text-to-speech.',
 ].join('\n')
 
-const STREAM_SECTION_INSTRUCTIONS: Record<SectionSpec['kind'], string> = {
+const STREAM_SECTION_INSTRUCTIONS: Record<
+  Exclude<SectionSpec['kind'], 'single-shot'>,
+  string
+> = {
   overview:
     'This section is the overview: what this pull request does and why, in plain language.',
   architecture:
@@ -503,6 +655,16 @@ const STREAM_SECTION_INSTRUCTIONS: Record<SectionSpec['kind'], string> = {
     'This section covers one batch of code changes: walk through these files by intent and logic flow.',
   'review-notes':
     'This section covers review feedback: weave the reviewer comments and reviews into a coherent narrative.',
+}
+
+/** System prompt text for a section spec; single-shot reuses the full-transcript prompt. */
+function systemTextFor(spec: SectionSpec): string {
+  if (spec.kind === 'single-shot') return SYSTEM_PROMPT
+  return `${STREAM_SYSTEM_BASE}\n${STREAM_SECTION_INSTRUCTIONS[spec.kind]}`
+}
+
+function systemTextForChanges(): string {
+  return systemTextFor({ kind: 'changes', files: [] })
 }
 
 function prHeader(pr: PullRequestData): string {
@@ -562,19 +724,56 @@ function architectureUserPrompt(
 
 function changesUserPrompt(
   pr: PullRequestData,
-  spec: Extract<SectionSpec, { kind: 'changes' }>,
+  files: PrFile[],
+  batch: number,
   totalBatches: number,
   context: string,
+  tokenBudget?: number,
 ): string {
   const lines: string[] = [
     prHeader(pr),
     context,
     '',
-    `## Files in this batch (batch ${spec.batch} of ${totalBatches})`,
+    `## Files in this batch (batch ${batch} of ${totalBatches})`,
   ]
-  for (const f of spec.files) {
+  for (const f of files) {
     lines.push(`- ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})`)
-    if (f.patch) lines.push(truncate(f.patch, 1200))
+  }
+  if (tokenBudget === undefined) {
+    for (const f of files) {
+      if (f.patch) lines.push(truncate(f.patch, 1200))
+    }
+  } else {
+    // Overflow control: fit patches into the token budget; a single file
+    // whose patch does not fit gets truncated with a '(truncated)' marker
+    // the note below tells the model about. The 32-token slack covers the
+    // join separators and the note line itself.
+    const effectiveBudget = tokenBudget - 32
+    let truncated = false
+    for (const f of files) {
+      if (!f.patch) continue
+      const used = estimateTokens(lines.join('\n'))
+      const capped = truncate(f.patch, 1200)
+      const cost = estimateTokens(capped)
+      if (used + cost <= effectiveBudget) {
+        lines.push(capped)
+        continue
+      }
+      const remaining = effectiveBudget - used
+      if (remaining >= 16) {
+        const chars = (remaining - 4) * 4
+        lines.push(`${f.patch.slice(0, Math.min(f.patch.length, 1200, chars))}\n(truncated)`)
+      } else {
+        lines.push('(patch omitted to fit the context window)')
+      }
+      truncated = true
+    }
+    if (truncated) {
+      lines.push(
+        '',
+        'Note: patches marked (truncated) or omitted were cut to fit the context window; cover only the visible part.',
+      )
+    }
   }
   return lines.join('\n')
 }
@@ -618,6 +817,14 @@ function deriveSummary(sentences: string[]): string {
  * overview; architecture (only with images/mermaid); Key Changes batches
  * (changes-1, changes-2, ...); review notes (only with feedback).
  * A failed section call emits a spoken fallback instead of killing the stream.
+ *
+ * Budget: without opts.budget the batching is the fixed default (10 files
+ * per batch, oversized patches isolated). With opts.budget, batch sizes come
+ * from the window (fat windows get fat batches, small windows shrink), every
+ * call is pre-checked against the per-call budget (over-large batches are
+ * binary-split, oversized single patches truncated with a '(truncated)'
+ * marker), and budget.singleShot collapses the whole PR into one call when
+ * everything fits the model's context window.
  */
 export function createTranscriptStream(
   config: LlmConfig,
@@ -632,15 +839,58 @@ export function createTranscriptStream(
     if (typeof dataUrl === 'string' && dataUrl.length > 0) images.push(dataUrl)
   }
 
-  const batches = batchFiles(pr.files)
-  const plan: SectionSpec[] = [{ kind: 'overview' }]
-  if (pr.imageUrls.length > 0 || pr.mermaidBlocks.length > 0) {
-    plan.push({ kind: 'architecture' })
+  const resolved = opts.budget !== undefined ? resolveBudget(opts.budget) : null
+
+  // Single-shot mode: opted in AND the whole PR (description, comments,
+  // reviews, every file patch, diagrams, images note) plus the prompt
+  // overhead fits the window. Otherwise fall back to sectioned batches.
+  function buildSingleShotMessages(): LlmMessage[] {
+    return [
+      { role: 'system', text: SYSTEM_PROMPT },
+      {
+        role: 'user',
+        text: buildUserPrompt(pr, images.length, pr.files.length),
+        images: images.length > 0 ? images : undefined,
+      },
+    ]
   }
-  batches.forEach((files, i) => plan.push({ kind: 'changes', batch: i + 1, files }))
-  if (pr.comments.length > 0 || pr.reviews.length > 0) {
-    plan.push({ kind: 'review-notes' })
+  function singleShotFits(messages: LlmMessage[], budget: ResolvedBudget): boolean {
+    // Every attached image bills as tokens too; count them so an
+    // image-bearing single shot falls back to sectioned mode when the
+    // images alone would blow the window.
+    const imageCount = messages.reduce((sum, m) => sum + (m.images?.length ?? 0), 0)
+    const input =
+      estimateTokens(messages[0]!.text) +
+      estimateTokens(messages[1]!.text) +
+      imageCount * IMAGE_TOKEN_ESTIMATE +
+      RESPONSE_ALLOWANCE
+    return input <= budget.contextTokens && input <= budget.maxContextPerCall
   }
+  const singleShotMessages =
+    resolved !== null && resolved.singleShot
+      ? (() => {
+          const messages = buildSingleShotMessages()
+          return singleShotFits(messages, resolved) ? messages : null
+        })()
+      : null
+
+  const batches = batchFiles(
+    pr.files,
+    resolved === null ? FILES_PER_BATCH : filesPerBatchFor(pr.files, resolved),
+  )
+  const plan: SectionSpec[] =
+    singleShotMessages !== null
+      ? [{ kind: 'single-shot' }]
+      : [
+          { kind: 'overview' as const },
+          ...(pr.imageUrls.length > 0 || pr.mermaidBlocks.length > 0
+            ? [{ kind: 'architecture' as const }]
+            : []),
+          ...batches.map((files) => ({ kind: 'changes' as const, files })),
+          ...(pr.comments.length > 0 || pr.reviews.length > 0
+            ? [{ kind: 'review-notes' as const }]
+            : []),
+        ]
 
   const ABORT = new Error('transcript stream aborted')
   const controller = new AbortController()
@@ -657,42 +907,111 @@ export function createTranscriptStream(
   let inFlight: Promise<Generated> | null = null
   let pendingNext: Promise<TranscriptSection | null> | null = null
   const summaries: string[] = []
+  // Sections after the first, emitted by a single-shot generation.
+  const singleShotQueue: TranscriptSection[] = []
+
+  /** Live numbering of a changes spec: 1-based index and current total. */
+  function changesNumbering(spec: Extract<SectionSpec, { kind: 'changes' }>): {
+    batch: number
+    total: number
+  } {
+    let total = 0
+    let batch = 0
+    for (const s of plan) {
+      if (s.kind !== 'changes') continue
+      total++
+      if (s === spec) batch = total
+    }
+    return { batch, total }
+  }
+
+  function sectionLabel(spec: SectionSpec): { id: string; title: string } {
+    switch (spec.kind) {
+      case 'overview':
+        return { id: 'overview', title: 'Overview' }
+      case 'architecture':
+        return { id: 'architecture', title: 'Architecture and Diagrams' }
+      case 'changes': {
+        const { batch } = changesNumbering(spec)
+        return { id: `changes-${batch}`, title: `Key Changes (${batch})` }
+      }
+      case 'review-notes':
+        return { id: 'review-notes', title: 'Review Notes' }
+      case 'single-shot':
+        return { id: 'overview', title: 'Overview' }
+    }
+  }
 
   function buildMessages(spec: SectionSpec): LlmMessage[] {
+    if (spec.kind === 'single-shot') return singleShotMessages!
     const context = contextBlock(summaries)
+    const sys = systemTextFor(spec)
+    // Images attach only to architecture calls, and (under a budget) only
+    // when their estimated token cost fits the per-call room; otherwise they
+    // are dropped and the prompt notes they could not be loaded.
+    const wants = spec.kind === 'architecture' ? images : []
+    const fit =
+      resolved !== null
+        ? fitImages(resolved, sys, wants)
+        : { images: wants, textBudget: 0 }
+    const attached = fit.images
     let user: string
     switch (spec.kind) {
       case 'overview':
         user = overviewUserPrompt(pr)
         break
       case 'architecture':
-        user = architectureUserPrompt(pr, images.length, context)
+        user = architectureUserPrompt(pr, attached.length, context)
         break
-      case 'changes':
-        user = changesUserPrompt(pr, spec, batches.length, context)
+      case 'changes': {
+        let { batch, total } = changesNumbering(spec)
+        if (resolved === null) {
+          user = changesUserPrompt(pr, spec.files, batch, total, context)
+        } else {
+          // Overflow pre-check: while the batch's prompt exceeds the
+          // per-call budget, binary-split the file list and queue the rest
+          // as a follow-up batch. A lone over-budget file falls through to
+          // the token-budgeted prompt builder, which truncates its patch.
+          const usable = userPromptBudget(resolved, sys)
+          while (spec.files.length > 1) {
+            const probe = changesUserPrompt(pr, spec.files, batch, total, context)
+            if (estimateTokens(probe) <= usable) break
+            const mid = Math.floor(spec.files.length / 2)
+            const rest = spec.files.slice(mid)
+            spec.files = spec.files.slice(0, mid)
+            plan.splice(plan.indexOf(spec) + 1, 0, { kind: 'changes', files: rest })
+            total = changesNumbering(spec).total
+          }
+          user = changesUserPrompt(pr, spec.files, batch, total, context, usable)
+        }
         break
+      }
       case 'review-notes':
         user = reviewUserPrompt(pr, context)
         break
     }
+    // Final overflow pre-check for every budgeted call: never send an
+    // over-budget user prompt. The budget already excludes the estimated
+    // cost of any attached images.
+    if (resolved !== null) {
+      user = clampPromptToTokens(user, fit.textBudget)
+    }
     return [
-      {
-        role: 'system',
-        text: `${STREAM_SYSTEM_BASE}\n${STREAM_SECTION_INSTRUCTIONS[spec.kind]}`,
-      },
+      { role: 'system', text: sys },
       {
         role: 'user',
         text: user,
-        images: spec.kind === 'architecture' && images.length > 0 ? images : undefined,
+        images: attached.length > 0 ? attached : undefined,
       },
     ]
   }
 
   function fallbackGenerated(spec: SectionSpec): Generated {
+    const { id, title } = sectionLabel(spec)
     return {
       section: {
-        id: sectionId(spec),
-        title: sectionTitle(spec),
+        id,
+        title,
         sentences: ['Could not summarize this part.'],
       },
       summary: 'This part could not be summarized.',
@@ -700,7 +1019,7 @@ export function createTranscriptStream(
   }
 
   async function generateSection(spec: SectionSpec): Promise<Generated> {
-    const id = sectionId(spec)
+    const { id, title } = sectionLabel(spec)
     let raw: string | null = null
     try {
       raw = await Promise.race([
@@ -711,26 +1030,38 @@ export function createTranscriptStream(
       if (aborted) throw ABORT
       raw = null
     }
+    if (spec.kind === 'single-shot') {
+      // One generation for the whole PR: materialize every section and
+      // queue all but the first (overview stays first via orderSections).
+      if (raw !== null) {
+        const transcript = materializeTranscript(raw, pr)
+        if (transcript.sections.length > 0) {
+          singleShotQueue.push(...transcript.sections.slice(1))
+          return { section: transcript.sections[0]!, summary: '' }
+        }
+      }
+      return fallbackGenerated(spec)
+    }
     if (raw !== null) {
       const parsed = extractJsonObject(raw)
       if (parsed !== undefined && isValidStreamSection(parsed)) {
         const sentences = parsed.sentences
           .flatMap((sentence) => splitSentences(sanitizeLine(sentence)))
           .filter((sentence) => sentence.length > 0)
-        const title = sanitizeLine(parsed.title)
-        if (title && sentences.length > 0) {
+        const cleanTitle = sanitizeLine(parsed.title)
+        if (cleanTitle && sentences.length > 0) {
           const summary =
             typeof parsed.summary === 'string' && parsed.summary.trim() !== ''
               ? truncate(parsed.summary.trim(), 400)
               : deriveSummary(sentences)
-          return { section: { id, title, sentences }, summary }
+          return { section: { id, title: cleanTitle, sentences }, summary }
         }
       } else if (parsed === undefined) {
         // No JSON at all: narrate the raw reply, like buildTranscript.
         const sentences = splitSentences(sanitizeLine(raw)).filter((s) => s.length > 0)
         if (sentences.length > 0) {
           return {
-            section: { id, title: sectionTitle(spec), sentences },
+            section: { id, title, sentences },
             summary: deriveSummary(sentences),
           }
         }
@@ -740,7 +1071,12 @@ export function createTranscriptStream(
   }
 
   async function doNext(): Promise<TranscriptSection | null> {
-    if (aborted || cursor >= plan.length) return null
+    if (aborted) return null
+    if (singleShotQueue.length > 0) {
+      cursor++
+      return singleShotQueue.shift()!
+    }
+    if (cursor >= plan.length) return null
     const spec = plan[cursor]!
     if (inFlight === null) inFlight = generateSection(spec)
     let generated: Generated
@@ -770,7 +1106,14 @@ export function createTranscriptStream(
     next,
 
     prefetch(): void {
-      if (aborted || cursor >= plan.length || inFlight !== null || pendingNext !== null) return
+      if (
+        aborted ||
+        singleShotQueue.length > 0 ||
+        cursor >= plan.length ||
+        inFlight !== null ||
+        pendingNext !== null
+      )
+        return
       inFlight = generateSection(plan[cursor]!)
       // abort() rejects this via the sentinel; without a handler a consumer
       // that prefetches and aborts before next() hits an unhandled rejection.
@@ -779,7 +1122,7 @@ export function createTranscriptStream(
     },
 
     done(): boolean {
-      return aborted || cursor >= plan.length
+      return aborted || (singleShotQueue.length === 0 && cursor >= plan.length)
     },
 
     abort(): void {

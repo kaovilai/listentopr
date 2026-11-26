@@ -2,12 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { chat, LlmError } from './llm'
 import type { ChatOptions } from './llm'
 import type { PrCommit } from './github'
-import { buildDeltaSection, buildTranscript, createTranscriptStream, sanitizeLine, splitSentences } from './transcript'
+import { buildDeltaSection, buildTranscript, createTranscriptStream, estimateTokens, IMAGE_TOKEN_ESTIMATE, resolveBudget, sanitizeLine, splitSentences } from './transcript'
 import type {
   LlmConfig,
   LlmMessage,
   PrFile,
   PullRequestData,
+  TranscriptBudget,
   TranscriptSection,
 } from './types'
 
@@ -823,5 +824,379 @@ describe('createTranscriptStream', () => {
     for await (const section of stream) ids.push(section.id)
     expect(ids).toEqual(['overview', 'changes-1'])
     expect(stream.done()).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Context-window budgeting
+// ---------------------------------------------------------------------------
+
+describe('estimateTokens', () => {
+  it('ceil-divides length by 4', () => {
+    expect(estimateTokens('')).toBe(0)
+    expect(estimateTokens('abc')).toBe(1)
+    expect(estimateTokens('abcd')).toBe(1)
+    expect(estimateTokens('abcde')).toBe(2)
+  })
+})
+
+describe('resolveBudget', () => {
+  it('defaults to 128000 window, per-call capped at the window, singleShot off', () => {
+    expect(resolveBudget()).toEqual({
+      contextTokens: 128000,
+      maxContextPerCall: 128000,
+      singleShot: false,
+    })
+  })
+
+  it('passes through an explicit singleShot flag', () => {
+    expect(resolveBudget({ singleShot: true }).singleShot).toBe(true)
+  })
+
+  it('clamps contextTokens into 8000..2000000', () => {
+    expect(resolveBudget({ contextTokens: 100 }).contextTokens).toBe(8000)
+    expect(resolveBudget({ contextTokens: 99999999 }).contextTokens).toBe(2000000)
+  })
+
+  it('clamps maxContextPerCall into 2000..2000000', () => {
+    expect(resolveBudget({ contextTokens: 99999999, maxContextPerCall: 100 }).maxContextPerCall).toBe(2000)
+    expect(resolveBudget({ contextTokens: 99999999, maxContextPerCall: 99999999 }).maxContextPerCall).toBe(2000000)
+  })
+
+  it('caps maxContextPerCall at contextTokens after clamping', () => {
+    expect(resolveBudget({ contextTokens: 50000, maxContextPerCall: 60000 })).toEqual({
+      contextTokens: 50000,
+      maxContextPerCall: 50000,
+      singleShot: false,
+    })
+    // default window also caps the 200000 per-call default
+    expect(resolveBudget({}).maxContextPerCall).toBe(128000)
+  })
+})
+
+describe('createTranscriptStream with budget', () => {
+  it('a fat window coalesces 40 small files into one changes call', async () => {
+    const pr = makeStreamPr({ files: makeFiles(40) })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, {
+      chat: fake,
+      budget: { contextTokens: 2000000, maxContextPerCall: 2000000 },
+    })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual(['overview', 'changes-1'])
+    expect(calls).toHaveLength(2)
+    const changesPrompt = calls[1]!.messages[1]!.text
+    expect(changesPrompt).toContain('src/f0.ts')
+    expect(changesPrompt).toContain('src/f39.ts')
+    expect(changesPrompt).toContain('batch 1 of 1')
+  })
+
+  it('a tiny window shrinks batches to one file each and keeps every prompt within budget', async () => {
+    const pr = makeStreamPr({ files: makeFiles(5) })
+    const budget: TranscriptBudget = { contextTokens: 128000, maxContextPerCall: 2000 }
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake, budget })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual([
+      'overview',
+      'changes-1',
+      'changes-2',
+      'changes-3',
+      'changes-4',
+      'changes-5',
+    ])
+    expect(calls).toHaveLength(6)
+    const firstBatch = calls[1]!.messages[1]!.text
+    expect(firstBatch).toContain('src/f0.ts')
+    expect(firstBatch).not.toContain('src/f1.ts')
+    for (const call of calls) {
+      expect(estimateTokens(call.messages[1]!.text)).toBeLessThanOrEqual(2000)
+    }
+  })
+
+  it('single-shot mode generates all sections in one call when the PR fits and is opted in', async () => {
+    const pr = makeStreamPr({
+      files: makeFiles(3),
+      comments: [{ author: 'r1', body: 'please add tests' }],
+      reviews: [{ author: 'r2', state: 'APPROVED', body: 'lgtm' }],
+      mermaidBlocks: ['graph TD\nA-->B'],
+    })
+    const reply = JSON.stringify({
+      title: 'All at once',
+      sections: [
+        { id: 'review-notes', title: 'Review Notes', sentences: ['Reviewers asked for tests.'] },
+        { id: 'changes', title: 'Key Changes', sentences: ['Three files changed.'] },
+        { id: 'architecture', title: 'Architecture', sentences: ['A flows to B.'] },
+        {
+          id: 'overview',
+          title: 'Overview',
+          sentences: ['The whole PR in one call. See https://example.com/x now.'],
+        },
+      ],
+    })
+    const { calls, chat: fake } = recordChat(() => reply)
+    const stream = createTranscriptStream(config, pr, {
+      chat: fake,
+      budget: { singleShot: true },
+    })
+    stream.prefetch()
+    expect(calls).toHaveLength(1)
+    const sections = await drain(stream)
+    // overview-first ordering preserved even though the reply listed it last
+    expect(sections.map((s) => s.id)).toEqual([
+      'overview',
+      'architecture',
+      'changes',
+      'review-notes',
+    ])
+    expect(sections[0]!.sentences).toEqual([
+      'The whole PR in one call.',
+      'See example.com now.',
+    ])
+    expect(stream.done()).toBe(true)
+    expect(calls).toHaveLength(1)
+    const user = calls[0]!.messages[1]!.text
+    expect(user).toContain('src/f0.ts')
+    expect(user).toContain('src/f2.ts')
+    expect(calls[0]!.messages[0]!.text).toContain('section ids')
+  })
+
+  it('single-shot is skipped when the PR does not fit the window, falling back to batches', async () => {
+    const pr = makeStreamPr({ files: makeFiles(14, 'x'.repeat(2000)) })
+    const budget: TranscriptBudget = { singleShot: true, contextTokens: 8000 }
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake, budget })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual(['overview', 'changes-1', 'changes-2'])
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      expect(estimateTokens(call.messages[1]!.text)).toBeLessThanOrEqual(8000)
+    }
+    // batched prompts, not one whole-PR prompt
+    expect(calls[1]!.messages[1]!.text).toContain('batch 1 of 2')
+  })
+
+  it('single-shot requires opt-in: a budget without the flag still sections the stream', async () => {
+    const pr = makeStreamPr({
+      files: makeFiles(3),
+      comments: [{ author: 'r1', body: 'nice' }],
+      mermaidBlocks: ['graph TD\nA-->B'],
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake, budget: {} })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual([
+      'overview',
+      'architecture',
+      'changes-1',
+      'review-notes',
+    ])
+    expect(calls).toHaveLength(4)
+  })
+
+  it('truncates an over-budget lone patch with a (truncated) marker and stays within budget', async () => {
+    const bigPatch = 'y'.repeat(4500)
+    const pr = makeStreamPr({ files: makeFiles(4, bigPatch) })
+    const budget: TranscriptBudget = { contextTokens: 128000, maxContextPerCall: 2000 }
+    const { calls, chat: fake } = recordChat((_call, i) =>
+      JSON.stringify({
+        title: `Sec ${i}`,
+        sentences: [`Sentence ${i}.`],
+        summary: 'sum '.repeat(100),
+      }),
+    )
+    const stream = createTranscriptStream(config, pr, { chat: fake, budget })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual([
+      'overview',
+      'changes-1',
+      'changes-2',
+      'changes-3',
+      'changes-4',
+    ])
+    const changesPrompts = calls.slice(1).map((c) => c.messages[1]!.text)
+    expect(changesPrompts.some((p) => p.includes('(truncated)'))).toBe(true)
+    expect(changesPrompts.some((p) => p.includes('fit the context window'))).toBe(true)
+    for (const call of calls) {
+      expect(estimateTokens(call.messages[1]!.text)).toBeLessThanOrEqual(2000)
+    }
+  })
+
+  it('binary-splits an over-budget batch instead of sending one oversized call', async () => {
+    const bigPatch = `BIGPATCH-${'b'.repeat(2000)}`
+    const pr = makeStreamPr({
+      files: [...makeFiles(7, bigPatch, 'big'), ...makeFiles(7, 'tiny hunk', 't')],
+    })
+    const budget: TranscriptBudget = { contextTokens: 128000, maxContextPerCall: 6000 }
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake, budget })
+    const sections = await drain(stream)
+    // plan-time sizing put 7 files per batch; the all-big-file batch overflows
+    // the per-call budget and is binary-split, so changes arrive as 3 batches.
+    expect(sections.map((s) => s.id)).toEqual([
+      'overview',
+      'changes-1',
+      'changes-2',
+      'changes-3',
+    ])
+    expect(calls).toHaveLength(4)
+    const batch1 = calls[1]!.messages[1]!.text
+    const batch2 = calls[2]!.messages[1]!.text
+    const batch3 = calls[3]!.messages[1]!.text
+    expect(batch1).toContain('src/big0.ts')
+    expect(batch1).toContain('src/big2.ts')
+    expect(batch1).not.toContain('src/big3.ts')
+    expect(batch2).toContain('src/big3.ts')
+    expect(batch2).toContain('src/big6.ts')
+    expect(batch2).not.toContain('src/t0.ts')
+    expect(batch3).toContain('src/t0.ts')
+    expect(batch3).toContain('src/t6.ts')
+    for (const call of calls) {
+      expect(estimateTokens(call.messages[1]!.text)).toBeLessThanOrEqual(6000)
+    }
+  })
+
+  it('single-shot falls back to sectioned mode when image cost blows the window', async () => {
+    const pr = makeStreamPr({
+      imageUrls: [
+        'https://img.example/1.png',
+        'https://img.example/2.png',
+        'https://img.example/3.png',
+      ],
+      files: makeFiles(2),
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, {
+      chat: fake,
+      imageDataUrls: [
+        'data:image/png;base64,ONE',
+        'data:image/png;base64,TWO',
+        'data:image/png;base64,THREE',
+      ],
+      // 3 images * 1600 tokens = 4800 on top of the prompt does not fit 8000
+      budget: { singleShot: true, contextTokens: 8000 },
+    })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual(['overview', 'architecture', 'changes-1'])
+    expect(calls).toHaveLength(3)
+  })
+
+  it('drops architecture images that do not fit the per-call budget and notes they could not be loaded', async () => {
+    const pr = makeStreamPr({
+      imageUrls: ['https://img.example/1.png', 'https://img.example/2.png'],
+      mermaidBlocks: ['graph TD\nA-->B'],
+      files: makeFiles(2),
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, {
+      chat: fake,
+      imageDataUrls: ['data:image/png;base64,ONE', 'data:image/png;base64,TWO'],
+      // tiny per-call budget: 2 images * 1600 tokens cannot fit
+      budget: { contextTokens: 128000, maxContextPerCall: 2000 },
+    })
+    await drain(stream)
+    const arch = calls[1]!.messages[1]!
+    expect(arch.images).toBeUndefined()
+    expect(arch.text).toContain('could not be loaded')
+    expect(arch.text).not.toContain('are attached')
+    expect(arch.text).toContain('graph TD')
+  })
+
+  it('keeps architecture images that fit and counts their cost against the text budget', async () => {
+    const pr = makeStreamPr({
+      imageUrls: ['https://img.example/1.png'],
+      mermaidBlocks: Array.from({ length: 10 }, () => 'g'.repeat(2000)),
+      files: makeFiles(2),
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, {
+      chat: fake,
+      imageDataUrls: ['data:image/png;base64,ONE'],
+      budget: { contextTokens: 128000, maxContextPerCall: 8000 },
+    })
+    await drain(stream)
+    const arch = calls[1]!.messages[1]!
+    expect(arch.images).toEqual(['data:image/png;base64,ONE'])
+    expect(arch.text).toContain('(truncated)')
+    const sysTokens = estimateTokens(calls[1]!.messages[0]!.text)
+    expect(estimateTokens(arch.text)).toBeLessThanOrEqual(
+      8000 - sysTokens - 4096 - IMAGE_TOKEN_ESTIMATE,
+    )
+  })
+})
+
+describe('buildDeltaSection with budget', () => {
+  it('clamps the delta prompt to the per-call budget with a (truncated) marker', async () => {
+    const { calls, chat: fake } = recordChat(() =>
+      JSON.stringify({ title: 't', sentences: ['New stuff landed.'] }),
+    )
+    await buildDeltaSection(config, makePr(), DELTA_COMMITS, 'previous '.repeat(3000), {
+      chat: fake,
+      budget: { contextTokens: 128000, maxContextPerCall: 2000 },
+    })
+    expect(calls).toHaveLength(1)
+    const user = calls[0]!.messages[1]!.text
+    expect(user).toContain('(truncated)')
+    expect(estimateTokens(user)).toBeLessThanOrEqual(2000)
+  })
+})
+
+describe('buildTranscript with budget', () => {
+  it('clamps the user prompt to the per-call budget with a (truncated) marker', async () => {
+    const fetchMock = stubFetch(() => okResponse('no json'))
+    const pr = makePr({ body: 'B'.repeat(20000) })
+    await buildTranscript(config, pr, {
+      budget: { contextTokens: 128000, maxContextPerCall: 2000 },
+    })
+    const body = JSON.parse(fetchMock.mock.calls[0]![1].body as string)
+    const user = body.messages[1].content
+    expect(typeof user).toBe('string')
+    expect(user).toContain('(truncated)')
+    expect(estimateTokens(user)).toBeLessThanOrEqual(2000)
+  })
+
+  it('drops images that do not fit the per-call budget and notes they could not be loaded', async () => {
+    const fetchMock = stubFetch(() => okResponse('no json'))
+    const pr = makePr({
+      imageUrls: ['https://img.example/1.png', 'https://img.example/2.png'],
+      body: 'Adds a cache.',
+    })
+    await buildTranscript(config, pr, {
+      imageDataUrls: ['data:image/png;base64,ONE', 'data:image/png;base64,TWO'],
+      // tiny per-call budget: 2 images * 1600 tokens cannot fit
+      budget: { contextTokens: 128000, maxContextPerCall: 2000 },
+    })
+    const body = JSON.parse(fetchMock.mock.calls[0]![1].body as string)
+    // no image parts: plain string content again
+    expect(typeof body.messages[1].content).toBe('string')
+    expect(body.messages[1].content).toContain('could not be loaded')
+    expect(body.messages[1].content).not.toContain('are attached')
+    expect(estimateTokens(body.messages[1].content)).toBeLessThanOrEqual(2000)
+  })
+
+  it('keeps images that fit and counts their cost against the text budget', async () => {
+    const fetchMock = stubFetch(() => okResponse('no json'))
+    const pr = makePr({
+      imageUrls: ['https://img.example/1.png', 'https://img.example/2.png'],
+      body: 'B'.repeat(20000),
+    })
+    await buildTranscript(config, pr, {
+      imageDataUrls: ['data:image/png;base64,ONE', 'data:image/png;base64,TWO'],
+      budget: { contextTokens: 128000, maxContextPerCall: 8500 },
+    })
+    const body = JSON.parse(fetchMock.mock.calls[0]![1].body as string)
+    const content = body.messages[1].content
+    expect(Array.isArray(content)).toBe(true)
+    expect(content).toHaveLength(3)
+    expect(content[0].type).toBe('text')
+    expect(content[0].text).toContain('(truncated)')
+    expect(content.slice(1)).toEqual([
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,ONE' } },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,TWO' } },
+    ])
+    const sysTokens = estimateTokens(body.messages[0].content)
+    expect(estimateTokens(content[0].text)).toBeLessThanOrEqual(
+      8500 - sysTokens - 4096 - 2 * IMAGE_TOKEN_ESTIMATE,
+    )
   })
 })

@@ -415,3 +415,120 @@ describe('diagramSectionSpoken', () => {
     expect(app.diagramSectionSpoken(undefined)).toBe(false)
   })
 })
+
+describe('parseContextSettings', () => {
+  it('returns empty for null, empty, and corrupt JSON', () => {
+    expect(app.parseContextSettings(null)).toEqual({})
+    expect(app.parseContextSettings('')).toEqual({})
+    expect(app.parseContextSettings('{not json')).toEqual({})
+    expect(app.parseContextSettings('undefined')).toEqual({})
+  })
+
+  it('returns empty for non-object JSON', () => {
+    expect(app.parseContextSettings('42')).toEqual({})
+    expect(app.parseContextSettings('"x"')).toEqual({})
+    expect(app.parseContextSettings('[1,2]')).toEqual({})
+    expect(app.parseContextSettings('null')).toEqual({})
+  })
+
+  it('keeps finite positive numbers and a true singleShot flag', () => {
+    expect(
+      app.parseContextSettings('{"contextTokens":64000,"maxContextPerCall":128000,"singleShot":true}'),
+    ).toEqual({ contextTokens: 64000, maxContextPerCall: 128000, singleShot: true })
+  })
+
+  it('omits zero, negative, non-finite, and non-number values', () => {
+    expect(
+      app.parseContextSettings('{"contextTokens":0,"maxContextPerCall":-5}'),
+    ).toEqual({})
+    expect(
+      app.parseContextSettings('{"contextTokens":Infinity,"maxContextPerCall":"128000"}'),
+    ).toEqual({})
+    expect(app.parseContextSettings('{"contextTokens":NaN}')).toEqual({})
+  })
+
+  it('omits singleShot unless exactly true', () => {
+    expect(app.parseContextSettings('{"singleShot":false}')).toEqual({})
+    expect(app.parseContextSettings('{"singleShot":"yes"}')).toEqual({})
+    expect(app.parseContextSettings('{"singleShot":1}')).toEqual({})
+  })
+
+  it('keeps valid fields while dropping invalid siblings', () => {
+    expect(app.parseContextSettings('{"contextTokens":200000,"maxContextPerCall":0,"singleShot":true}')).toEqual(
+      { contextTokens: 200000, singleShot: true },
+    )
+  })
+})
+
+describe('readContextBudget', () => {
+  it('reads parsed settings from localStorage', () => {
+    storage.set('listentopr.llm-context', '{"contextTokens":32000,"singleShot":true}')
+    expect(app.readContextBudget()).toEqual({ contextTokens: 32000, singleShot: true })
+  })
+
+  it('tolerates corrupt stored values by degrading to empty', () => {
+    storage.set('listentopr.llm-context', 'garbage{')
+    expect(app.readContextBudget()).toEqual({})
+    storage.delete('listentopr.llm-context')
+    expect(app.readContextBudget()).toEqual({})
+  })
+})
+
+describe('parseContextTokens', () => {
+  it('parses positive numbers with surrounding whitespace', () => {
+    expect(app.parseContextTokens('128000')).toBe(128000)
+    expect(app.parseContextTokens('  64000 ')).toBe(64000)
+  })
+
+  it('is null for empty input (field left unset)', () => {
+    expect(app.parseContextTokens('')).toBeNull()
+    expect(app.parseContextTokens('   ')).toBeNull()
+  })
+
+  it('is null for non-numeric, zero, negative, and non-finite input', () => {
+    expect(app.parseContextTokens('abc')).toBeNull()
+    expect(app.parseContextTokens('12px')).toBeNull()
+    expect(app.parseContextTokens('0')).toBeNull()
+    expect(app.parseContextTokens('-1000')).toBeNull()
+    expect(app.parseContextTokens('Infinity')).toBeNull()
+    expect(app.parseContextTokens('NaN')).toBeNull()
+  })
+})
+
+describe('isSingleShotMessages', () => {
+  it('is true for a user prompt carrying the whole-PR file block', () => {
+    expect(
+      app.isSingleShotMessages([
+        { role: 'system', text: 'You narrate pull requests.' },
+        { role: 'user', text: 'Pull request: o/r#1\n\n## Changed files\n- a.ts' },
+      ]),
+    ).toBe(true)
+  })
+
+  it('is false for sectioned prompts and non-user roles', () => {
+    expect(
+      app.isSingleShotMessages([
+        { role: 'user', text: '## Files in this batch (batch 1 of 2)\n- a.ts' },
+      ]),
+    ).toBe(false)
+    expect(app.isSingleShotMessages([{ role: 'user', text: '## Description' }])).toBe(false)
+    expect(app.isSingleShotMessages([{ role: 'system', text: '## Changed files' }])).toBe(false)
+    expect(app.isSingleShotMessages([])).toBe(false)
+  })
+})
+
+describe('initialStreamStatus', () => {
+  it('prefers the resume message over the single-pass note', () => {
+    expect(app.initialStreamStatus('Resumed at section 2, sentence 3', true)).toBe(
+      'Resumed at section 2, sentence 3',
+    )
+  })
+
+  it('notes single-pass generation when single-shot fired', () => {
+    expect(app.initialStreamStatus(null, true)).toBe('Generating in a single pass.')
+  })
+
+  it('is null without a resume message or single pass', () => {
+    expect(app.initialStreamStatus(null, false)).toBeNull()
+  })
+})

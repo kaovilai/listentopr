@@ -162,6 +162,18 @@ export interface LlmMessage {
   images?: string[]
 }
 
+// ---------- Context-window budgeting ----------
+
+/** Context-window-aware generation knobs. All fields optional. */
+export interface TranscriptBudget {
+  /** Model context window, tokens. Default 128000. */
+  contextTokens?: number
+  /** Max input tokens per LLM call. Default 200000. */
+  maxContextPerCall?: number
+  /** When true and the whole PR fits contextTokens, use one single call. */
+  singleShot?: boolean
+}
+
 // ---------- Streaming transcript ----------
 
 /**

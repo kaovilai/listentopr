@@ -15,6 +15,7 @@ import {
   buildDeltaSection,
   type TranscriptStreamHandle,
 } from './transcript'
+import { chat } from './llm'
 import { createTtsController, listVoices } from './tts'
 import { createWakeLockController, shouldShowWakeLockFallback } from './wakelock'
 import { createUpdateController, type UpdateController } from './update'
@@ -36,11 +37,13 @@ import {
 } from './diagrams'
 import type {
   LlmConfig,
+  LlmMessage,
   LlmProvider,
   PullRequestData,
   PullRequestRef,
   SecretId,
   Transcript,
+  TranscriptBudget,
   TranscriptSection,
   TtsState,
 } from './types'
@@ -82,6 +85,7 @@ const KEYS = {
   endpoint: 'listentopr.llm-endpoint',
   model: 'listentopr.llm-model',
   visionModel: 'listentopr.llm-vision-model',
+  context: 'listentopr.llm-context',
   prefs: 'listentopr.tts-prefs',
   wlDismissed: 'listentopr.wl-banner-dismissed',
 } as const
@@ -98,6 +102,15 @@ const PROVIDER_NAMES: ReadonlyArray<readonly [LlmProvider, string]> = [
 export function readProvider(): LlmProvider {
   const v = lsGet(KEYS.provider)
   return PROVIDERS.includes(v as LlmProvider) ? (v as LlmProvider) : 'openai'
+}
+
+/** Persisted context budget; empty when unset or corrupt. */
+export function readContextBudget(): TranscriptBudget {
+  return parseContextSettings(lsGet(KEYS.context))
+}
+
+function writeContextSettings(settings: TranscriptBudget): void {
+  lsSet(KEYS.context, JSON.stringify(settings))
 }
 
 function lsGet(key: string): string | null {
@@ -316,6 +329,72 @@ export function transcriptToText(title: string, sections: TranscriptSection[]): 
     parts.push('')
   }
   return parts.join('\n').trim() + '\n'
+}
+
+// ---------- context-budget settings ----------
+
+/**
+ * Parse the persisted context-budget settings ('listentopr.llm-context',
+ * JSON {contextTokens, maxContextPerCall, singleShot}). Tolerates corrupt
+ * input by omission: only finite numbers greater than zero survive, and
+ * singleShot only when exactly true. Anything else is dropped, so a damaged
+ * record degrades to engine defaults rather than breaking a load.
+ */
+export function parseContextSettings(raw: string | null): TranscriptBudget {
+  if (raw === null || raw === '') return {}
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return {}
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
+  const o = parsed as Record<string, unknown>
+  const out: TranscriptBudget = {}
+  if (
+    typeof o.contextTokens === 'number' &&
+    Number.isFinite(o.contextTokens) &&
+    o.contextTokens > 0
+  ) {
+    out.contextTokens = o.contextTokens
+  }
+  if (
+    typeof o.maxContextPerCall === 'number' &&
+    Number.isFinite(o.maxContextPerCall) &&
+    o.maxContextPerCall > 0
+  ) {
+    out.maxContextPerCall = o.maxContextPerCall
+  }
+  if (o.singleShot === true) out.singleShot = true
+  return out
+}
+
+/** Free-text token count: finite and > 0, else null (empty input = unset). */
+export function parseContextTokens(raw: string): number | null {
+  const trimmed = raw.trim()
+  if (trimmed === '') return null
+  const n = Number(trimmed)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+/**
+ * True when a stream chat call carries the whole-PR single-shot prompt: only
+ * that prompt includes the '## Changed files' block (sectioned calls say
+ * '## Files in this batch'; overview/review calls list no files at all).
+ */
+export function isSingleShotMessages(messages: LlmMessage[]): boolean {
+  return messages.some(
+    (m) => m.role === 'user' && m.text.includes('## Changed files'),
+  )
+}
+
+/** Status line after the first streamed section (resume note wins). */
+export function initialStreamStatus(
+  resumeMsg: string | null,
+  singlePass: boolean,
+): string | null {
+  if (resumeMsg !== null) return resumeMsg
+  return singlePass ? 'Generating in a single pass.' : null
 }
 
 // ---------- CSP endpoint validation ----------
@@ -604,6 +683,30 @@ function buildSettingsPanel(): HTMLDivElement {
   )
   const apiKey = labeledInput('LLM API key', 'password')
 
+  // Advanced: context-budget knobs (persisted non-secret in localStorage).
+  const savedBudget = readContextBudget()
+  const contextWindow = labeledInput(
+    'Context window (tokens)',
+    'text',
+    savedBudget.contextTokens !== undefined ? String(savedBudget.contextTokens) : '',
+  )
+  contextWindow.input.placeholder = '128000'
+  contextWindow.input.inputMode = 'numeric'
+  const maxPerCall = labeledInput(
+    'Max per call (tokens)',
+    'text',
+    savedBudget.maxContextPerCall !== undefined ? String(savedBudget.maxContextPerCall) : '',
+  )
+  maxPerCall.input.placeholder = '200000'
+  maxPerCall.input.inputMode = 'numeric'
+  const singleWrap = el('div', 'field')
+  const singleLabel = el('label', 'field-label', 'Single-shot when it fits')
+  const singleShotBox = el('input')
+  singleShotBox.type = 'checkbox'
+  singleShotBox.checked = savedBudget.singleShot === true
+  singleLabel.appendChild(singleShotBox)
+  singleWrap.appendChild(singleLabel)
+
   const save = el('button', 'btn btn-primary', 'Save settings')
   save.type = 'button'
   save.addEventListener('click', () => {
@@ -617,6 +720,13 @@ function buildSettingsPanel(): HTMLDivElement {
         }
         const patVal = pat.input.value.trim()
         if (patVal) {
+          // Shape check: catches truncated pastes. Warn, still save —
+          // formats evolve and we do not want to block valid new prefixes.
+          if (!/^(ghp_|gho_|ghu_|ghs_|github_pat_|[0-9a-fA-F]{40})/.test(patVal)) {
+            setStatus(
+              'Heads up: that token does not look like a GitHub PAT (expected ghp_…, github_pat_…, gho_… or a 40-char classic token). Saved anyway.',
+            )
+          }
           await vault.putSecret('github-token', patVal)
           pat.input.value = ''
         }
@@ -629,6 +739,19 @@ function buildSettingsPanel(): HTMLDivElement {
         lsSet(KEYS.endpoint, endpoint.input.value.trim())
         lsSet(KEYS.model, model.input.value.trim())
         lsSet(KEYS.visionModel, visionModel.input.value.trim())
+        const ctxRaw = contextWindow.input.value.trim()
+        const perCallRaw = maxPerCall.input.value.trim()
+        const ctxVal = parseContextTokens(ctxRaw)
+        const perCallVal = parseContextTokens(perCallRaw)
+        if ((ctxRaw !== '' && ctxVal === null) || (perCallRaw !== '' && perCallVal === null)) {
+          setStatus('Context settings must be numbers greater than zero.')
+          return
+        }
+        writeContextSettings({
+          ...(ctxVal !== null ? { contextTokens: ctxVal } : {}),
+          ...(perCallVal !== null ? { maxContextPerCall: perCallVal } : {}),
+          singleShot: singleShotBox.checked,
+        })
         setStatus('Settings saved.', 'info')
       } catch (err) {
         setStatus(sanitizeError(err))
@@ -658,6 +781,7 @@ function buildSettingsPanel(): HTMLDivElement {
       lsRemove(KEYS.endpoint)
       lsRemove(KEYS.model)
       lsRemove(KEYS.visionModel)
+      lsRemove(KEYS.context)
       lsRemove(KEYS.prefs)
       showSetup()
     })()
@@ -669,6 +793,13 @@ function buildSettingsPanel(): HTMLDivElement {
   panel.appendChild(model.wrap)
   panel.appendChild(visionModel.wrap)
   panel.appendChild(apiKey.wrap)
+  panel.appendChild(el('h3', 'panel-advanced-title', 'Advanced'))
+  panel.appendChild(
+    el('p', 'muted', 'Context budget for transcript generation; empty fields use the defaults.'),
+  )
+  panel.appendChild(contextWindow.wrap)
+  panel.appendChild(maxPerCall.wrap)
+  panel.appendChild(singleWrap)
   panel.appendChild(save)
 
   const autoLock = el(
@@ -1875,6 +2006,12 @@ async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<voi
   if (controlsEl) controlsEl.hidden = true
   try {
     const token = (await vaultGetSecret('github-token')) ?? ''
+    // Silent null (locked vault, or secret saved under a different unlock
+    // method) used to become an empty bearer -> misleading 401. Surface it
+    // and continue tokenless (public PRs still work).
+    if (token === '' && !vault.isUnlocked()) {
+      setStatus('Vault locked — continuing without a GitHub token')
+    }
     const pr = await fetchPullRequest(ref, token)
     if (myLoad !== loadToken) return
     const title = sanitizeLine(pr.title) || 'Pull request'
@@ -1947,7 +2084,28 @@ async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<voi
       )
       .map((r) => r.value)
     if (myLoad !== loadToken) return
-    const s = createTranscriptStream(cfg, pr, { imageDataUrls })
+    // Context budget: only passed when the user set at least one knob, so an
+    // untouched install keeps the classic fixed batching. Single-shot can
+    // only fire when opted in; a chat wrapper watches for it so the status
+    // line can note the single pass (see isSingleShotMessages).
+    const budget = readContextBudget()
+    const budgeted =
+      budget.contextTokens !== undefined ||
+      budget.maxContextPerCall !== undefined ||
+      budget.singleShot !== undefined
+    let singlePass = false
+    let chatFn: typeof chat | null = null
+    if (budgeted && budget.singleShot === true) {
+      chatFn = (config, messages, opts) => {
+        if (!singlePass && isSingleShotMessages(messages)) singlePass = true
+        return chat(config, messages, opts)
+      }
+    }
+    const s = createTranscriptStream(cfg, pr, {
+      imageDataUrls,
+      ...(budgeted ? { budget } : {}),
+      ...(chatFn !== null ? { chat: chatFn } : {}),
+    })
     stream = s
     streamSections = []
     renderStreamTitle(title)
@@ -1968,7 +2126,8 @@ async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<voi
     if (store) void store.recordListen(ref, headSha ?? '')
     const resumeMsg = await applyResume(ref)
     if (myLoad !== loadToken) return
-    if (resumeMsg) setStatus(resumeMsg, 'info')
+    const note = initialStreamStatus(resumeMsg, singlePass)
+    if (note) setStatus(note, 'info')
     playbackActive = true
     tts.play()
     // Later sections arrive via onTtsChange prefetching (advanceStream).
