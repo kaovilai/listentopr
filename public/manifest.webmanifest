@@ -1,0 +1,34 @@
+{
+  "name": "ListenToPR",
+  "short_name": "ListenToPR",
+  "description": "Turn any GitHub pull request into a listenable audio briefing with text-to-speech.",
+  "start_url": ".",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1117",
+  "theme_color": "#0f1117",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ],
+  "share_target": {
+    "action": "./",
+    "method": "GET",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url"
+    }
+  },
+  "_note": "PNG icons (192x192, 512x512) can be added later for richer install prompts; SVG entries keep the manifest valid meanwhile."
+}

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self' https://api.github.com https://github.com https://*.githubusercontent.com __CSP_LLM_ENDPOINT__; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <title>ListenToPR</title>
+  </head>
+  <body>
+    <noscript>ListenToPR requires JavaScript to run.</noscript>
+    <div id="app"></div>
+    <script type="module" src="/src/app.ts"></script>
+  </body>
+</html>
