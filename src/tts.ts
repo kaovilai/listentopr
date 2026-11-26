@@ -1,6 +1,6 @@
 // speechSynthesis controller (DVC section 3).
 // Everything flows through injectable deps so tests need no globals.
-import type { Transcript, TtsController, TtsPrefs, TtsState } from './types'
+import type { Transcript, TranscriptSection, TtsController, TtsPrefs, TtsState } from './types'
 
 export interface SpeechSynthesisVoiceLike {
   name: string
@@ -109,6 +109,8 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
   const listeners = new Set<(state: TtsState, currentSentence: string | null) => void>()
 
   let queue: QueueItem[] = []
+  /** Sections loaded so far; appendSections continues the numbering. */
+  let sectionCount = 0
   let idx = 0
   let playing = false
   let paused = false
@@ -268,6 +270,30 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
       idx = 0
       playing = false
       paused = false
+      sectionCount = transcript.sections.length
+      fire()
+    },
+
+    appendSections(sections: TranscriptSection[]): void {
+      if (sections.length === 0) return
+      const newItems: QueueItem[] = []
+      for (const section of sections) {
+        if (section === undefined || section === null) continue
+        // Empty sections still consume an index so numbering stays uniform
+        // with a freshly loaded transcript of the same sections.
+        const sectionIndex = sectionCount
+        sectionCount++
+        for (let i = 0; i < section.sentences.length; i++) {
+          const text = section.sentences[i]
+          if (text === undefined) continue
+          newItems.push({ sectionIndex, sentenceIndex: i, text })
+        }
+      }
+      queue.push(...newItems)
+      // No generation bump and no index mutation: a live utterance's onend
+      // reads queue.length at fire time, so playback chains seamlessly into
+      // the appended sentences; stale (cancelled) onends keep failing the
+      // existing generation check. Stopped/paused playback just extends.
       fire()
     },
 

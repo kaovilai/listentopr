@@ -1,6 +1,14 @@
 // Transcript pipeline (DVC section 2): turn PR data into a speakable transcript.
 import { chat } from './llm'
-import type { LlmConfig, LlmMessage, PullRequestData, Transcript, TranscriptSection } from './types'
+import type {
+  LlmConfig,
+  LlmMessage,
+  PrFile,
+  PullRequestData,
+  Transcript,
+  TranscriptSection,
+  TranscriptStream,
+} from './types'
 
 export interface BuildTranscriptOptions {
   /** Resolved data URLs mapping index-wise to pr.imageUrls. */
@@ -313,4 +321,405 @@ export async function buildTranscript(
   ]
   const raw = await chat(config, messages)
   return materializeTranscript(raw, pr)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming transcript
+// ---------------------------------------------------------------------------
+
+export interface TranscriptStreamOptions {
+  /** Resolved data URLs mapping index-wise to pr.imageUrls. */
+  imageDataUrls?: string[]
+  /** Injectable chat fn (tests). Defaults to the real LLM client. */
+  chat?: typeof chat
+}
+
+/** TranscriptStream plus the next() cursor callers drive directly. */
+export interface TranscriptStreamHandle extends TranscriptStream {
+  /** Await + return the next section, or null once done/aborted. */
+  next(): Promise<TranscriptSection | null>
+}
+
+type SectionSpec =
+  | { kind: 'overview' }
+  | { kind: 'architecture' }
+  | { kind: 'changes'; batch: number; files: PrFile[] }
+  | { kind: 'review-notes' }
+
+interface Generated {
+  section: TranscriptSection
+  /** Short recap carried into later calls' prompts (rolling context). */
+  summary: string
+}
+
+const BIG_PATCH_CHARS = 4000
+const FILES_PER_BATCH = 10
+
+/**
+ * Split files into LLM batches: small files coalesce up to FILES_PER_BATCH;
+ * a file whose patch exceeds BIG_PATCH_CHARS gets a batch of its own.
+ */
+function batchFiles(files: PrFile[]): PrFile[][] {
+  const batches: PrFile[][] = []
+  let current: PrFile[] = []
+  const flush = (): void => {
+    if (current.length > 0) {
+      batches.push(current)
+      current = []
+    }
+  }
+  for (const f of files) {
+    if ((f.patch?.length ?? 0) > BIG_PATCH_CHARS) {
+      flush()
+      batches.push([f])
+    } else {
+      current.push(f)
+      if (current.length >= FILES_PER_BATCH) flush()
+    }
+  }
+  flush()
+  return batches
+}
+
+function sectionId(spec: SectionSpec): string {
+  switch (spec.kind) {
+    case 'overview':
+      return 'overview'
+    case 'architecture':
+      return 'architecture'
+    case 'changes':
+      return `changes-${spec.batch}`
+    case 'review-notes':
+      return 'review-notes'
+  }
+}
+
+function sectionTitle(spec: SectionSpec): string {
+  switch (spec.kind) {
+    case 'overview':
+      return 'Overview'
+    case 'architecture':
+      return 'Architecture and Diagrams'
+    case 'changes':
+      return `Key Changes (${spec.batch})`
+    case 'review-notes':
+      return 'Review Notes'
+  }
+}
+
+const STREAM_SYSTEM_BASE = [
+  'You are a senior software engineer explaining a pull request aloud to a colleague who is listening, not reading.',
+  'Respond with STRICT JSON only: no markdown fences, no prose outside the JSON.',
+  'JSON shape: {"title": string, "sentences": string[], "summary": string}.',
+  'title: a short heading for this section.',
+  'sentences: the spoken content of this section; never quote code verbatim.',
+  'summary: a recap of this section in two to three sentences, used as context for later sections.',
+  'Every sentence must be self-contained and natural when read aloud by text-to-speech.',
+].join('\n')
+
+const STREAM_SECTION_INSTRUCTIONS: Record<SectionSpec['kind'], string> = {
+  overview:
+    'This section is the overview: what this pull request does and why, in plain language.',
+  architecture:
+    'This section covers architecture and diagrams: describe every mermaid diagram and attached image in plain English, covering what the nodes or components are and how they connect.',
+  changes:
+    'This section covers one batch of code changes: walk through these files by intent and logic flow.',
+  'review-notes':
+    'This section covers review feedback: weave the reviewer comments and reviews into a coherent narrative.',
+}
+
+function prHeader(pr: PullRequestData): string {
+  return [
+    `Pull request: ${pr.ref.owner}/${pr.ref.repo}#${pr.ref.number}`,
+    `Title: ${pr.title}`,
+    `Author: ${pr.author}`,
+    `Size: ${pr.changedFiles} files changed, ${pr.additions} additions, ${pr.deletions} deletions.`,
+  ].join('\n')
+}
+
+function contextBlock(summaries: string[]): string {
+  if (summaries.length === 0) return ''
+  return [
+    '',
+    '## Context so far (summaries of earlier sections; do not repeat their content)',
+    ...summaries.map((s) => `- ${s}`),
+  ].join('\n')
+}
+
+function overviewUserPrompt(pr: PullRequestData): string {
+  const lines: string[] = [
+    prHeader(pr),
+    '',
+    '## Description',
+    truncate(pr.body || '(no description)', 6000),
+  ]
+  if (pr.comments.length > 0) {
+    lines.push('', '## Comments')
+    for (const c of pr.comments) lines.push(`- ${c.author}: ${truncate(c.body, 800)}`)
+  }
+  return lines.join('\n')
+}
+
+function architectureUserPrompt(
+  pr: PullRequestData,
+  attachedImages: number,
+  context: string,
+): string {
+  const lines: string[] = [prHeader(pr), context]
+  if (pr.mermaidBlocks.length > 0) {
+    lines.push(
+      '',
+      '## Mermaid diagrams (describe each in plain English: nodes, edges, overall structure)',
+    )
+    pr.mermaidBlocks.forEach((block, i) => {
+      lines.push(`Diagram ${i + 1}:`, truncate(block, 2000))
+    })
+  }
+  if (attachedImages > 0) {
+    lines.push('', `${attachedImages} image(s) from the pull request are attached to this message.`)
+  } else if (pr.imageUrls.length > 0) {
+    lines.push('', `${pr.imageUrls.length} image(s) were referenced but could not be loaded.`)
+  }
+  return lines.join('\n')
+}
+
+function changesUserPrompt(
+  pr: PullRequestData,
+  spec: Extract<SectionSpec, { kind: 'changes' }>,
+  totalBatches: number,
+  context: string,
+): string {
+  const lines: string[] = [
+    prHeader(pr),
+    context,
+    '',
+    `## Files in this batch (batch ${spec.batch} of ${totalBatches})`,
+  ]
+  for (const f of spec.files) {
+    lines.push(`- ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})`)
+    if (f.patch) lines.push(truncate(f.patch, 1200))
+  }
+  return lines.join('\n')
+}
+
+function reviewUserPrompt(pr: PullRequestData, context: string): string {
+  const lines: string[] = [
+    prHeader(pr),
+    context,
+    '',
+    '## Review comments and reviews (weave into review notes)',
+  ]
+  for (const c of pr.comments) lines.push(`- ${c.author}: ${truncate(c.body, 800)}`)
+  for (const r of pr.reviews) lines.push(`- ${r.author} (${r.state}): ${truncate(r.body, 800)}`)
+  return lines.join('\n')
+}
+
+interface RawStreamSection {
+  title: string
+  sentences: string[]
+  summary?: string
+}
+
+function isValidStreamSection(v: unknown): v is RawStreamSection {
+  if (typeof v !== 'object' || v === null) return false
+  const s = v as { title?: unknown; sentences?: unknown }
+  return (
+    typeof s.title === 'string' &&
+    s.title.trim() !== '' &&
+    Array.isArray(s.sentences) &&
+    s.sentences.every((x) => typeof x === 'string')
+  )
+}
+
+function deriveSummary(sentences: string[]): string {
+  return truncate(sentences.slice(0, 2).join(' '), 300)
+}
+
+/**
+ * Lazily-generated transcript: one LLM call per section, in order, each call
+ * carrying only short summaries of the sections before it. Sections:
+ * overview; architecture (only with images/mermaid); Key Changes batches
+ * (changes-1, changes-2, ...); review notes (only with feedback).
+ * A failed section call emits a spoken fallback instead of killing the stream.
+ */
+export function createTranscriptStream(
+  config: LlmConfig,
+  pr: PullRequestData,
+  opts: TranscriptStreamOptions = {},
+): TranscriptStreamHandle {
+  const chatFn = opts.chat ?? chat
+  const imageDataUrls = opts.imageDataUrls ?? []
+  const images: string[] = []
+  for (let i = 0; i < pr.imageUrls.length; i++) {
+    const dataUrl = imageDataUrls[i]
+    if (typeof dataUrl === 'string' && dataUrl.length > 0) images.push(dataUrl)
+  }
+
+  const batches = batchFiles(pr.files)
+  const plan: SectionSpec[] = [{ kind: 'overview' }]
+  if (pr.imageUrls.length > 0 || pr.mermaidBlocks.length > 0) {
+    plan.push({ kind: 'architecture' })
+  }
+  batches.forEach((files, i) => plan.push({ kind: 'changes', batch: i + 1, files }))
+  if (pr.comments.length > 0 || pr.reviews.length > 0) {
+    plan.push({ kind: 'review-notes' })
+  }
+
+  const ABORT = new Error('transcript stream aborted')
+  const controller = new AbortController()
+  let rejectAbort: ((reason: Error) => void) | null = null
+  const abortSignal = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject
+  })
+  // The rejection is always observed via Promise.race; silence it so an
+  // unused abort never surfaces as an unhandled rejection.
+  abortSignal.catch(() => {})
+
+  let aborted = false
+  let cursor = 0
+  let inFlight: Promise<Generated> | null = null
+  let pendingNext: Promise<TranscriptSection | null> | null = null
+  const summaries: string[] = []
+
+  function buildMessages(spec: SectionSpec): LlmMessage[] {
+    const context = contextBlock(summaries)
+    let user: string
+    switch (spec.kind) {
+      case 'overview':
+        user = overviewUserPrompt(pr)
+        break
+      case 'architecture':
+        user = architectureUserPrompt(pr, images.length, context)
+        break
+      case 'changes':
+        user = changesUserPrompt(pr, spec, batches.length, context)
+        break
+      case 'review-notes':
+        user = reviewUserPrompt(pr, context)
+        break
+    }
+    return [
+      {
+        role: 'system',
+        text: `${STREAM_SYSTEM_BASE}\n${STREAM_SECTION_INSTRUCTIONS[spec.kind]}`,
+      },
+      {
+        role: 'user',
+        text: user,
+        images: spec.kind === 'architecture' && images.length > 0 ? images : undefined,
+      },
+    ]
+  }
+
+  function fallbackGenerated(spec: SectionSpec): Generated {
+    return {
+      section: {
+        id: sectionId(spec),
+        title: sectionTitle(spec),
+        sentences: ['Could not summarize this part.'],
+      },
+      summary: 'This part could not be summarized.',
+    }
+  }
+
+  async function generateSection(spec: SectionSpec): Promise<Generated> {
+    const id = sectionId(spec)
+    let raw: string | null = null
+    try {
+      raw = await Promise.race([
+        chatFn(config, buildMessages(spec), { signal: controller.signal }),
+        abortSignal,
+      ])
+    } catch {
+      if (aborted) throw ABORT
+      raw = null
+    }
+    if (raw !== null) {
+      const parsed = extractJsonObject(raw)
+      if (parsed !== undefined && isValidStreamSection(parsed)) {
+        const sentences = parsed.sentences
+          .flatMap((sentence) => splitSentences(sanitizeLine(sentence)))
+          .filter((sentence) => sentence.length > 0)
+        const title = sanitizeLine(parsed.title)
+        if (title && sentences.length > 0) {
+          const summary =
+            typeof parsed.summary === 'string' && parsed.summary.trim() !== ''
+              ? truncate(parsed.summary.trim(), 400)
+              : deriveSummary(sentences)
+          return { section: { id, title, sentences }, summary }
+        }
+      } else if (parsed === undefined) {
+        // No JSON at all: narrate the raw reply, like buildTranscript.
+        const sentences = splitSentences(sanitizeLine(raw)).filter((s) => s.length > 0)
+        if (sentences.length > 0) {
+          return {
+            section: { id, title: sectionTitle(spec), sentences },
+            summary: deriveSummary(sentences),
+          }
+        }
+      }
+    }
+    return fallbackGenerated(spec)
+  }
+
+  async function doNext(): Promise<TranscriptSection | null> {
+    if (aborted || cursor >= plan.length) return null
+    const spec = plan[cursor]!
+    if (inFlight === null) inFlight = generateSection(spec)
+    let generated: Generated
+    try {
+      generated = await inFlight
+    } catch {
+      // Only the abort sentinel rejects; a failed call became a fallback.
+      inFlight = null
+      return null
+    }
+    inFlight = null
+    cursor++
+    summaries.push(`${generated.section.title}: ${generated.summary}`)
+    return generated.section
+  }
+
+  function next(): Promise<TranscriptSection | null> {
+    // Concurrent next() calls queue up instead of duplicating a section.
+    if (pendingNext !== null) return pendingNext
+    pendingNext = doNext().finally(() => {
+      pendingNext = null
+    })
+    return pendingNext
+  }
+
+  const stream: TranscriptStreamHandle = {
+    next,
+
+    prefetch(): void {
+      if (aborted || cursor >= plan.length || inFlight !== null || pendingNext !== null) return
+      inFlight = generateSection(plan[cursor]!)
+      // abort() rejects this via the sentinel; without a handler a consumer
+      // that prefetches and aborts before next() hits an unhandled rejection.
+      // The catch only marks it handled: doNext's await still sees the abort.
+      inFlight.catch(() => {})
+    },
+
+    done(): boolean {
+      return aborted || cursor >= plan.length
+    },
+
+    abort(): void {
+      if (aborted) return
+      aborted = true
+      controller.abort()
+      rejectAbort?.(ABORT)
+    },
+
+    [Symbol.asyncIterator]() {
+      return {
+        next: async (): Promise<IteratorResult<TranscriptSection>> => {
+          const value = await next()
+          return value === null ? { done: true, value: undefined } : { done: false, value }
+        },
+      }
+    },
+  }
+  return stream
 }

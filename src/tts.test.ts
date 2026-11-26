@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createTtsController, listVoices } from './tts'
 import type { SpeechSynthesisLike, StorageLike, UtteranceCtor } from './tts'
-import type { Transcript, TtsState } from './types'
+import type { Transcript, TranscriptSection, TtsState } from './types'
 
 // ---- fakes: synth records calls, tests trigger onend/onerror manually ----
 
@@ -506,5 +506,165 @@ describe('listVoices', () => {
       { name: 'Alex' },
       { name: 'Sam' },
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// appendSections (streaming)
+// ---------------------------------------------------------------------------
+
+describe('appendSections', () => {
+  const appended: TranscriptSection = { id: 's3', title: 'More', sentences: ['D one.', 'D two.'] }
+
+  it('appending while playing continues seamlessly into the new section', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    c.appendSections([appended])
+    // The live utterance is untouched; only the queue grew.
+    expect(env.spoken.map((u) => u.text)).toEqual(['A one.'])
+    for (let i = 0; i < 6; i++) fireEnd(last(env.spoken))
+    // 6 original sentences consumed -> chained into the appended section.
+    expect(env.spoken[6]!.text).toBe('D one.')
+    expect(c.state()).toMatchObject({ playing: true, sectionIndex: 3, sentenceIndex: 0 })
+    fireEnd(last(env.spoken))
+    fireEnd(last(env.spoken))
+    expect(c.state().playing).toBe(false)
+    expect(env.spoken.map((u) => u.text)).toEqual([
+      'A one.',
+      'A two.',
+      'B one.',
+      'C one.',
+      'C two.',
+      'C three.',
+      'D one.',
+      'D two.',
+    ])
+  })
+
+  it('appending while stopped extends the queue; play then covers everything', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    fireEnd(env.spoken[0]!)
+    c.stop()
+    c.appendSections([appended])
+    expect(c.state()).toEqual({
+      playing: false,
+      paused: false,
+      sectionIndex: 0,
+      sentenceIndex: 0,
+    })
+    c.play()
+    let guard = 0
+    while (c.state().playing && guard++ < 20) fireEnd(last(env.spoken))
+    expect(c.state().playing).toBe(false)
+    expect(env.spoken[env.spoken.length - 1]!.text).toBe('D two.')
+    for (const text of [
+      'A one.',
+      'A two.',
+      'B one.',
+      'C one.',
+      'C two.',
+      'C three.',
+      'D one.',
+      'D two.',
+    ]) {
+      expect(env.spoken.map((u) => u.text)).toContain(text)
+    }
+  })
+
+  it('appending while paused keeps position and pause state', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    c.pause()
+    c.appendSections([appended])
+    expect(c.state()).toEqual({
+      playing: true,
+      paused: true,
+      sectionIndex: 0,
+      sentenceIndex: 0,
+    })
+    c.resume()
+    expect(c.state().paused).toBe(false)
+    fireEnd(last(env.spoken))
+    expect(last(env.spoken).text).toBe('A two.')
+    expect(c.state()).toMatchObject({ sectionIndex: 0, sentenceIndex: 1 })
+  })
+
+  it('stale onend after an append does not skip or double-advance', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    const stale = env.spoken[0]!
+    c.skip(1) // cancels the stale utterance, speaks 'A two.'
+    c.appendSections([appended])
+    fireEnd(stale) // late event from the cancelled utterance
+    expect(env.spoken).toHaveLength(2)
+    expect(c.state()).toMatchObject({ playing: true, sectionIndex: 0, sentenceIndex: 1 })
+    fireEnd(env.spoken[1]!) // real end -> next sentence
+    expect(env.spoken[2]!.text).toBe('B one.')
+  })
+
+  it('stale onend from before stop + append + play is ignored', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    const stale = env.spoken[0]!
+    c.stop()
+    c.appendSections([appended])
+    c.play()
+    fireEnd(stale)
+    expect(env.spoken).toHaveLength(2)
+    expect(c.state()).toMatchObject({ playing: true, sectionIndex: 0, sentenceIndex: 0 })
+    fireEnd(env.spoken[1]!)
+    expect(env.spoken[2]!.text).toBe('A two.')
+  })
+
+  it('skip and skipSection reach into appended sections', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    c.skip(4 as 1) // (2,1) 'C two.'
+    c.appendSections([appended])
+    c.skip(1) // previously the last sentence; now advances into (2,2)
+    expect(last(env.spoken).text).toBe('C three.')
+    c.skipSection(1) // into the appended section
+    expect(last(env.spoken).text).toBe('D one.')
+    expect(c.state()).toMatchObject({ playing: true, sectionIndex: 3, sentenceIndex: 0 })
+  })
+
+  it('appending to an empty transcript queues the content for playback', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load({ title: 'empty', sections: [] })
+    c.appendSections([appended])
+    expect(c.state()).toEqual({
+      playing: false,
+      paused: false,
+      sectionIndex: 0,
+      sentenceIndex: 0,
+    })
+    c.play()
+    expect(env.spoken[0]!.text).toBe('D one.')
+    expect(c.state()).toMatchObject({ playing: true, sectionIndex: 0, sentenceIndex: 0 })
+  })
+
+  it('appending an empty array is a no-op', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    c.appendSections([])
+    expect(env.spoken).toHaveLength(1)
+    fireEnd(last(env.spoken))
+    expect(env.spoken[1]!.text).toBe('A two.')
   })
 })

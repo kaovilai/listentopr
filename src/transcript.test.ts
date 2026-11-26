@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { chat, LlmError } from './llm'
-import { buildTranscript, sanitizeLine, splitSentences } from './transcript'
-import type { LlmConfig, PullRequestData } from './types'
+import type { ChatOptions } from './llm'
+import { buildTranscript, createTranscriptStream, sanitizeLine, splitSentences } from './transcript'
+import type {
+  LlmConfig,
+  LlmMessage,
+  PrFile,
+  PullRequestData,
+  TranscriptSection,
+} from './types'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -369,5 +376,368 @@ describe('buildTranscript', () => {
     const body = JSON.parse(fetchMock.mock.calls[0]![1].body as string)
     expect(body.messages[1].content).not.toContain('reviewer1')
     expect(body.messages[1].content).not.toContain('graph TD')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// createTranscriptStream
+// ---------------------------------------------------------------------------
+
+function makeStreamPr(overrides: Partial<PullRequestData> = {}): PullRequestData {
+  return {
+    ref: { owner: 'acme', repo: 'widget', number: 9 },
+    title: 'Stream PR',
+    body: 'Stream body.',
+    author: 'tigger',
+    additions: 10,
+    deletions: 2,
+    changedFiles: 2,
+    files: [
+      {
+        filename: 'src/a.ts',
+        status: 'modified',
+        additions: 5,
+        deletions: 1,
+        patch: '@@ -1 +1 @@\n+ALPHA-HUNK',
+      },
+      {
+        filename: 'src/b.ts',
+        status: 'modified',
+        additions: 5,
+        deletions: 1,
+        patch: '@@ -1 +1 @@\n+BETA-HUNK',
+      },
+    ],
+    comments: [],
+    reviews: [],
+    imageUrls: [],
+    mermaidBlocks: [],
+    ...overrides,
+  }
+}
+
+function makeFiles(count: number, patch = 'small hunk', prefix = 'f'): PrFile[] {
+  return Array.from({ length: count }, (_, i) => ({
+    filename: `src/${prefix}${i}.ts`,
+    status: 'modified',
+    additions: 1,
+    deletions: 1,
+    patch,
+  }))
+}
+
+function sectionJson(i: number): string {
+  return JSON.stringify({
+    title: `Sec ${i}`,
+    sentences: [`Look at https://example.com/${i} now.`],
+    summary: `sum-${i}`,
+  })
+}
+
+interface RecordedCall {
+  messages: LlmMessage[]
+  opts?: ChatOptions
+}
+
+function recordChat(
+  responder: (call: RecordedCall, index: number) => string | Promise<string>,
+) {
+  const calls: RecordedCall[] = []
+  const fn: typeof chat = (_config, messages, opts) => {
+    calls.push({ messages, opts })
+    return Promise.resolve(responder({ messages, opts }, calls.length - 1))
+  }
+  return { calls, chat: fn }
+}
+
+const defaultResponder = (_call: RecordedCall, i: number): string => sectionJson(i)
+
+async function drain(stream: {
+  next(): Promise<TranscriptSection | null>
+}): Promise<TranscriptSection[]> {
+  const sections: TranscriptSection[] = []
+  for (;;) {
+    const section = await stream.next()
+    if (section === null) return sections
+    sections.push(section)
+  }
+}
+
+describe('createTranscriptStream', () => {
+  it('emits sections in order with canonical ids, skipping absent ones', async () => {
+    const pr = makeStreamPr({
+      imageUrls: ['https://img.example/1.png', 'https://img.example/2.png'],
+      mermaidBlocks: ['graph TD\nA-->B'],
+      files: makeFiles(12),
+      comments: [{ author: 'r1', body: 'comment body' }],
+      reviews: [{ author: 'r2', state: 'APPROVED', body: 'review body' }],
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, {
+      chat: fake,
+      imageDataUrls: ['data:image/png;base64,ONE', 'data:image/png;base64,TWO'],
+    })
+    expect(stream.done()).toBe(false)
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual([
+      'overview',
+      'architecture',
+      'changes-1',
+      'changes-2',
+      'review-notes',
+    ])
+    // Reuses sanitizeLine/splitSentences: URL -> domain, title kept.
+    expect(sections[0]!.title).toBe('Sec 0')
+    expect(sections[0]!.sentences).toEqual(['Look at example.com now.'])
+    expect(stream.done()).toBe(true)
+    expect(calls).toHaveLength(5)
+  })
+
+  it('skips architecture without images/mermaid and review notes without feedback', async () => {
+    const pr = makeStreamPr({ files: makeFiles(2) })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual(['overview', 'changes-1'])
+    expect(calls).toHaveLength(2)
+  })
+
+  it('includes review notes but not architecture when only feedback exists', async () => {
+    const pr = makeStreamPr({
+      files: makeFiles(2),
+      comments: [{ author: 'r1', body: 'nice work' }],
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual(['overview', 'changes-1', 'review-notes'])
+    const reviewPrompt = calls[2]!.messages[1]!.text
+    expect(reviewPrompt).toContain('r1')
+    expect(reviewPrompt).toContain('nice work')
+  })
+
+  it('attaches images only to the architecture call', async () => {
+    const pr = makeStreamPr({
+      imageUrls: ['https://img.example/1.png', 'https://img.example/2.png'],
+      mermaidBlocks: ['graph TD\nA-->B'],
+      files: makeFiles(2),
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, {
+      chat: fake,
+      imageDataUrls: ['data:image/png;base64,ONE', 'data:image/png;base64,TWO'],
+    })
+    await drain(stream)
+    expect(calls[0]!.messages[1]!.images).toBeUndefined()
+    expect(calls[1]!.messages[1]!.images).toEqual([
+      'data:image/png;base64,ONE',
+      'data:image/png;base64,TWO',
+    ])
+    expect(calls[2]!.messages[1]!.images).toBeUndefined()
+    const archPrompt = calls[1]!.messages[1]!.text
+    expect(archPrompt).toContain('graph TD')
+    expect(archPrompt).toContain('image(s) from the pull request are attached')
+  })
+
+  it('batches small files up to 10 and coalesces the tiny remainder', async () => {
+    const pr = makeStreamPr({ files: makeFiles(25) })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual([
+      'overview',
+      'changes-1',
+      'changes-2',
+      'changes-3',
+    ])
+    const batch1 = calls[1]!.messages[1]!.text
+    const batch2 = calls[2]!.messages[1]!.text
+    const batch3 = calls[3]!.messages[1]!.text
+    expect(batch1).toContain('src/f0.ts')
+    expect(batch1).toContain('src/f9.ts')
+    expect(batch1).not.toContain('src/f10.ts')
+    expect(batch2).toContain('src/f10.ts')
+    expect(batch2).toContain('src/f19.ts')
+    expect(batch2).not.toContain('src/f20.ts')
+    expect(batch3).toContain('src/f20.ts')
+    expect(batch3).toContain('src/f24.ts')
+    expect(batch3).toContain('batch 3 of 3')
+  })
+
+  it('gives a file with an oversized patch its own batch', async () => {
+    const bigPatch = `BIGHUNK ${'x'.repeat(4001)}`
+    const pr = makeStreamPr({
+      files: [
+        ...makeFiles(3, 'alpha hunk', 'a'),
+        { filename: 'src/big.ts', status: 'modified', additions: 900, deletions: 900, patch: bigPatch },
+        ...makeFiles(2, 'beta hunk', 'b'),
+      ],
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const sections = await drain(stream)
+    expect(sections.map((s) => s.id)).toEqual([
+      'overview',
+      'changes-1',
+      'changes-2',
+      'changes-3',
+    ])
+    const batch1 = calls[1]!.messages[1]!.text
+    const batch2 = calls[2]!.messages[1]!.text
+    const batch3 = calls[3]!.messages[1]!.text
+    expect(batch1).toContain('src/a0.ts')
+    expect(batch1).not.toContain('BIGHUNK')
+    expect(batch2).toContain('src/big.ts')
+    expect(batch2).toContain('BIGHUNK')
+    expect(batch2).not.toContain('src/a0.ts')
+    expect(batch2).not.toContain('src/b0.ts')
+    expect(batch3).toContain('src/b0.ts')
+    expect(batch3).not.toContain('BIGHUNK')
+  })
+
+  it('later prompts carry rolling summaries, not full sections or repeated diffs', async () => {
+    const pr = makeStreamPr({
+      files: [...makeFiles(10, 'ALPHA-HUNK', 'a'), ...makeFiles(12, 'BETA-HUNK', 'b')],
+    })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    await drain(stream)
+    // batches: a0-a9, b0-b9, b10-b11 -> calls: overview, changes-1..3
+    const overviewPrompt = calls[0]!.messages[1]!.text
+    expect(overviewPrompt).not.toContain('Context so far')
+    expect(overviewPrompt).not.toContain('ALPHA-HUNK')
+    expect(overviewPrompt).not.toContain('BETA-HUNK')
+    const changes2Prompt = calls[2]!.messages[1]!.text
+    expect(changes2Prompt).toContain('sum-0')
+    expect(changes2Prompt).toContain('sum-1')
+    // Not the full earlier sections...
+    expect(changes2Prompt).not.toContain('Look at example.com now.')
+    expect(changes2Prompt).not.toContain('https://example.com/')
+    // ...and not the earlier batch's diff text.
+    expect(changes2Prompt).toContain('BETA-HUNK')
+    expect(changes2Prompt).toContain('src/b0.ts')
+    expect(changes2Prompt).not.toContain('ALPHA-HUNK')
+    expect(changes2Prompt).not.toContain('src/a0.ts')
+  })
+
+  it('derives a rolling summary when the reply omits the summary field', async () => {
+    const pr = makeStreamPr({ files: makeFiles(2) })
+    const { calls, chat: fake } = recordChat((_call, i) =>
+      JSON.stringify({
+        title: `T${i}`,
+        sentences: [`Plain sentence ${i} one.`, `Plain sentence ${i} two.`],
+      }),
+    )
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    await drain(stream)
+    const changesPrompt = calls[1]!.messages[1]!.text
+    expect(changesPrompt).toContain('Plain sentence 0 one.')
+    expect(changesPrompt).toContain('Plain sentence 0 two.')
+  })
+
+  it('prefetch is memoized and next() resolves from the memoized call', async () => {
+    const pr = makeStreamPr({ files: makeFiles(2) })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    expect(stream.done()).toBe(false)
+    stream.prefetch()
+    stream.prefetch()
+    expect(calls).toHaveLength(1)
+    const first = await stream.next()
+    expect(first?.id).toBe('overview')
+    expect(calls).toHaveLength(1) // served from the memoized promise
+    stream.prefetch()
+    expect(calls).toHaveLength(2)
+    const second = await stream.next()
+    expect(second?.id).toBe('changes-1')
+    expect(calls).toHaveLength(2)
+    expect(await stream.next()).toBeNull()
+    expect(stream.done()).toBe(true)
+  })
+
+  it('abort cancels the in-flight call and settles a pending next() as null', async () => {
+    const pr = makeStreamPr({ files: makeFiles(2) })
+    const { calls, chat: fake } = recordChat(() => new Promise<string>(() => {}))
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const pending = stream.next()
+    expect(calls).toHaveLength(1)
+    stream.abort()
+    expect(stream.done()).toBe(true)
+    expect(calls[0]!.opts?.signal?.aborted).toBe(true)
+    await expect(pending).resolves.toBeNull()
+    await expect(stream.next()).resolves.toBeNull()
+  })
+
+  it('abort before any generation marks the stream done with no calls', async () => {
+    const pr = makeStreamPr({ files: makeFiles(2) })
+    const { calls, chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    stream.abort()
+    expect(stream.done()).toBe(true)
+    await expect(stream.next()).resolves.toBeNull()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('prefetch then abort with no consumer leaves no unhandled rejection', async () => {
+    const pr = makeStreamPr({ files: makeFiles(2) })
+    const { calls, chat: fake } = recordChat(() => new Promise<string>(() => {}))
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    stream.prefetch()
+    expect(calls).toHaveLength(1)
+    stream.abort()
+    // Let the microtask/macrotask queues drain: if the aborted inFlight
+    // promise rejects unhandled, Node/Vitest fails the run here.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(stream.done()).toBe(true)
+    await expect(stream.next()).resolves.toBeNull()
+  })
+
+  it('a failed section emits a spoken fallback and the stream continues', async () => {
+    const pr = makeStreamPr({
+      files: makeFiles(2),
+      comments: [{ author: 'r1', body: 'nice' }],
+    })
+    const { calls, chat: fake } = recordChat((_call, i) => {
+      if (i === 1) throw new Error('boom')
+      return sectionJson(i)
+    })
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const first = await stream.next()
+    expect(first?.id).toBe('overview')
+    const second = await stream.next()
+    expect(second).toMatchObject({
+      id: 'changes-1',
+      title: 'Key Changes (1)',
+      sentences: ['Could not summarize this part.'],
+    })
+    const third = await stream.next()
+    expect(third?.id).toBe('review-notes')
+    expect(third?.sentences).toEqual(['Look at example.com now.'])
+    expect(await stream.next()).toBeNull()
+    expect(calls).toHaveLength(3)
+    // The fallback's summary rolls into the next call's context.
+    expect(calls[2]!.messages[1]!.text).toContain('could not be summarized')
+  })
+
+  it('narrates a non-JSON reply as a section instead of failing', async () => {
+    const pr = makeStreamPr({ files: makeFiles(2) })
+    const { chat: fake } = recordChat(() => 'Not JSON at all. Still useful.')
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const first = await stream.next()
+    expect(first).toMatchObject({
+      id: 'overview',
+      title: 'Overview',
+      sentences: ['Not JSON at all.', 'Still useful.'],
+    })
+  })
+
+  it('supports for-await iteration ending after the last section', async () => {
+    const pr = makeStreamPr({ files: makeFiles(2) })
+    const { chat: fake } = recordChat(defaultResponder)
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const ids: string[] = []
+    for await (const section of stream) ids.push(section.id)
+    expect(ids).toEqual(['overview', 'changes-1'])
+    expect(stream.done()).toBe(true)
   })
 })

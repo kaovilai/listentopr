@@ -8,16 +8,21 @@ import {
   fetchPullRequest,
   fetchImageAsDataUrl,
 } from './github'
-import { buildTranscript } from './transcript'
+import {
+  createTranscriptStream,
+  sanitizeLine,
+  type TranscriptStreamHandle,
+} from './transcript'
 import { createTtsController, listVoices } from './tts'
 import { createWakeLockController, shouldShowWakeLockFallback } from './wakelock'
 import { createUpdateController, type UpdateController } from './update'
 import { connectSrcValue, endpointAllowedByConnectSrc } from './csp'
 import type {
   LlmConfig,
+  LlmProvider,
   PullRequestRef,
   SecretId,
-  Transcript,
+  TranscriptSection,
   TtsState,
 } from './types'
 
@@ -54,11 +59,27 @@ function labeledInput(
 
 const KEYS = {
   vaultReady: 'listentopr.vault-ready',
+  provider: 'listentopr.llm-provider',
   endpoint: 'listentopr.llm-endpoint',
   model: 'listentopr.llm-model',
+  visionModel: 'listentopr.llm-vision-model',
   prefs: 'listentopr.tts-prefs',
   wlDismissed: 'listentopr.wl-banner-dismissed',
 } as const
+
+const PROVIDERS: readonly LlmProvider[] = ['openai', 'anthropic', 'gemini']
+
+const PROVIDER_NAMES: ReadonlyArray<readonly [LlmProvider, string]> = [
+  ['openai', 'OpenAI'],
+  ['anthropic', 'Anthropic'],
+  ['gemini', 'Gemini'],
+]
+
+/** Persisted provider choice; 'openai' when unset or invalid. */
+export function readProvider(): LlmProvider {
+  const v = lsGet(KEYS.provider)
+  return PROVIDERS.includes(v as LlmProvider) ? (v as LlmProvider) : 'openai'
+}
 
 function lsGet(key: string): string | null {
   try {
@@ -312,7 +333,8 @@ function showSetup(): void {
 function showLocked(): void {
   resetRoot()
   if (!root) return
-  // stop playback and drop transcript on lock
+  // stop playback and drop transcript (and any in-flight stream) on lock
+  abortActiveStream()
   try {
     tts.stop()
   } catch {
@@ -377,12 +399,30 @@ function buildSettingsPanel(): HTMLDivElement {
   panel.appendChild(el('h2', 'panel-title', 'Settings'))
 
   const pat = labeledInput('GitHub personal access token', 'password')
+
+  const providerWrap = el('div', 'field')
+  const providerLabel = el('label', 'field-label', 'LLM provider')
+  const providerSelect = el('select', 'select')
+  PROVIDER_NAMES.forEach(([value, name]) => {
+    const opt = el('option', undefined, name)
+    opt.value = value
+    providerSelect.appendChild(opt)
+  })
+  providerSelect.value = readProvider()
+  providerLabel.appendChild(providerSelect)
+  providerWrap.appendChild(providerLabel)
+
   const endpoint = labeledInput(
-    'LLM endpoint',
+    'LLM endpoint (empty = provider default)',
     'text',
     lsGet(KEYS.endpoint) ?? '',
   )
   const model = labeledInput('LLM model', 'text', lsGet(KEYS.model) ?? '')
+  const visionModel = labeledInput(
+    'Vision model (optional, used when the PR has images)',
+    'text',
+    lsGet(KEYS.visionModel) ?? '',
+  )
   const apiKey = labeledInput('LLM API key', 'password')
 
   const save = el('button', 'btn btn-primary', 'Save settings')
@@ -406,8 +446,10 @@ function buildSettingsPanel(): HTMLDivElement {
           await vault.putSecret('llm-api-key', keyVal)
           apiKey.input.value = ''
         }
+        lsSet(KEYS.provider, providerSelect.value)
         lsSet(KEYS.endpoint, endpoint.input.value.trim())
         lsSet(KEYS.model, model.input.value.trim())
+        lsSet(KEYS.visionModel, visionModel.input.value.trim())
         setStatus('Settings saved.', 'info')
       } catch (err) {
         setStatus(sanitizeError(err))
@@ -431,16 +473,20 @@ function buildSettingsPanel(): HTMLDivElement {
         return
       }
       lsRemove(KEYS.vaultReady)
+      lsRemove(KEYS.provider)
       lsRemove(KEYS.endpoint)
       lsRemove(KEYS.model)
+      lsRemove(KEYS.visionModel)
       lsRemove(KEYS.prefs)
       showSetup()
     })()
   })
 
   panel.appendChild(pat.wrap)
+  panel.appendChild(providerWrap)
   panel.appendChild(endpoint.wrap)
   panel.appendChild(model.wrap)
+  panel.appendChild(visionModel.wrap)
   panel.appendChild(apiKey.wrap)
   panel.appendChild(save)
 
@@ -478,10 +524,11 @@ function clearActiveSentence(): void {
 function updateControlStates(state: TtsState): void {
   if (playBtn) {
     playBtn.textContent = state.paused ? 'Resume' : 'Play'
-    playBtn.disabled = state.playing && !state.paused
+    // While holding for the next section the player stays visually busy.
+    playBtn.disabled = (state.playing && !state.paused) || streamHolding
   }
   if (pauseBtn) pauseBtn.disabled = !(state.playing && !state.paused)
-  if (stopBtn) stopBtn.disabled = !(state.playing || state.paused)
+  if (stopBtn) stopBtn.disabled = !(state.playing || state.paused) && !streamHolding
 }
 
 function onTtsChange(state: TtsState): void {
@@ -499,32 +546,227 @@ function onTtsChange(state: TtsState): void {
   } else {
     wakeLock.release()
   }
+  // Streaming pipeline: prefetch ahead of speech, hold at the ready edge.
+  const s = stream
+  if (s === null || streamResuming) return
+  if (state.playing && !state.paused) {
+    advanceStream(s, state)
+    return
+  }
+  if (
+    streamHoldNeeded(state, {
+      active: true,
+      started: streamStarted,
+      done: s.done(),
+    })
+  ) {
+    streamHolding = true
+    streamHoldFlatIndex = flatSentenceCursor(
+      streamSections,
+      state.sectionIndex,
+      state.sentenceIndex,
+    )
+    setStatus('Generating next section…', 'info')
+    updateControlStates(state)
+    s.prefetch()
+    consumeNextStreamSection(s)
+  }
 }
 
-function renderTranscriptView(t: Transcript): void {
+/** Stop speech and cancel any in-flight transcript stream. */
+function stopPlayback(): void {
+  const wasHolding = streamHolding
+  abortActiveStream()
+  tts.stop()
+  if (wasHolding) clearStatus()
+}
+
+// ---------- streaming transcript ----------
+
+/** Speech asks the stream for the next section this many sentences early. */
+export const PREFETCH_SENTENCES_LEFT = 4
+
+export interface StreamHoldInfo {
+  /** A transcript stream is attached. */
+  active: boolean
+  /** Playback was started for the current stream. */
+  started: boolean
+  /** The stream has emitted every section. */
+  done: boolean
+}
+
+/**
+ * True when speech is inside the last PREFETCH_SENTENCES_LEFT sentences of
+ * the last ready section (or past them): time to generate the next section.
+ */
+export function shouldPrefetchNow(
+  state: TtsState,
+  sections: TranscriptSection[],
+): boolean {
+  if (!state.playing || state.paused) return false
+  const last = sections[sections.length - 1]
+  if (!last) return false
+  if (state.sectionIndex < sections.length - 1) return false
+  return last.sentences.length - state.sentenceIndex <= PREFETCH_SENTENCES_LEFT
+}
+
+/** True when playback ran out of ready content while the stream has more. */
+export function streamHoldNeeded(state: TtsState, info: StreamHoldInfo): boolean {
+  return info.active && info.started && !info.done && !state.playing && !state.paused
+}
+
+let stream: TranscriptStreamHandle | null = null
+let streamSections: TranscriptSection[] = []
+/** Playback was started for the current stream (first section played). */
+let streamStarted = false
+/** Speech ended at the end of ready content while more sections are coming. */
+let streamHolding = false
+/**
+ * Flat queue cursor (sentence count before the current one) captured when the
+ * hold began. Resume must land past it, wherever the cursor drifted since.
+ */
+let streamHoldFlatIndex: number | null = null
+/** Guards against duplicate next() consumers for one stream. */
+let streamConsume: Promise<void> | null = null
+/** Suppresses hold detection while resuming into freshly appended content. */
+let streamResuming = false
+/** Bumped whenever the active stream is aborted; invalidates in-flight loads. */
+let loadToken = 0
+
+function abortActiveStream(): void {
+  loadToken++
+  if (stream !== null) {
+    stream.abort()
+    stream = null
+  }
+  streamSections = []
+  streamStarted = false
+  streamHolding = false
+  streamHoldFlatIndex = null
+}
+
+function renderStreamTitle(title: string): void {
   if (!transcriptEl) return
-  const container = transcriptEl
-  container.textContent = ''
-  container.appendChild(el('h2', 'transcript-title', t.title))
-  t.sections.forEach((section, si) => {
-    const sec = el('section', 't-section')
-    sec.appendChild(el('h3', 't-section-title', section.title))
-    const wrap = el('p', 't-sentences')
-    section.sentences.forEach((sentence, i) => {
-      const span = el('span', 'sentence', sentence)
-      span.dataset.si = String(si)
-      span.dataset.i = String(i)
-      // controller has no seek API; click gives visual focus + scroll
-      span.addEventListener('click', () => {
-        setActiveSentence(si, i)
-      })
-      wrap.appendChild(span)
-      wrap.appendChild(document.createTextNode(' '))
+  transcriptEl.textContent = ''
+  transcriptEl.appendChild(el('h2', 'transcript-title', title))
+  transcriptEl.hidden = false
+}
+
+/** Append one section to the transcript view; indices match the tts queue. */
+function appendSectionToView(section: TranscriptSection): void {
+  if (!transcriptEl) return
+  const si = streamSections.length
+  const sec = el('section', 't-section')
+  sec.appendChild(el('h3', 't-section-title', section.title))
+  const wrap = el('p', 't-sentences')
+  section.sentences.forEach((sentence, i) => {
+    const span = el('span', 'sentence', sentence)
+    span.dataset.si = String(si)
+    span.dataset.i = String(i)
+    // controller has no seek API; click gives visual focus + scroll
+    span.addEventListener('click', () => {
+      setActiveSentence(si, i)
     })
-    sec.appendChild(wrap)
-    container.appendChild(sec)
+    wrap.appendChild(span)
+    wrap.appendChild(document.createTextNode(' '))
   })
-  container.hidden = false
+  sec.appendChild(wrap)
+  transcriptEl.appendChild(sec)
+}
+
+function appendStreamSection(section: TranscriptSection): void {
+  // render before push: appendSectionToView numbers by streamSections.length
+  appendSectionToView(section)
+  streamSections.push(section)
+  tts.appendSections([section])
+}
+
+/** Flat queue position of (sectionIndex, sentenceIndex) within sections. */
+export function flatSentenceCursor(
+  sections: TranscriptSection[],
+  sectionIndex: number,
+  sentenceIndex: number,
+): number {
+  let flat = 0
+  for (let s = 0; s < sectionIndex && s < sections.length; s++) {
+    flat += sections[s]!.sentences.length
+  }
+  return flat + sentenceIndex
+}
+
+/**
+ * Forward steps needed on resume so playback starts at the first sentence
+ * appended after the hold began. The cursor may have moved back through the
+ * prev buttons during the hold, so the distance is measured from where the
+ * cursor is now, not assumed to be one step.
+ */
+export function resumeSkipCount(holdFlatIndex: number, currentFlatIndex: number): number {
+  return Math.max(1, holdFlatIndex - currentFlatIndex + 1)
+}
+
+/** Move to the first sentence appended after a natural end, then play. */
+function resumeStreamPlayback(): void {
+  streamResuming = true
+  try {
+    // A natural finish leaves the cursor on the last spoken sentence; jump to
+    // the first newly appended one so it is not repeated. If the user moved
+    // the cursor back during the hold, skip the full distance forward.
+    const holdFlatIndex = streamHoldFlatIndex
+    streamHoldFlatIndex = null
+    if (holdFlatIndex === null) {
+      tts.skip(1)
+    } else {
+      const now = tts.state()
+      const steps = resumeSkipCount(
+        holdFlatIndex,
+        flatSentenceCursor(streamSections, now.sectionIndex, now.sentenceIndex),
+      )
+      for (let n = 0; n < steps; n++) tts.skip(1)
+    }
+    tts.play()
+  } finally {
+    streamResuming = false
+  }
+}
+
+/** Pull the next section (sharing any prefetched call) and append it. */
+function consumeNextStreamSection(s: TranscriptStreamHandle): void {
+  if (streamConsume !== null) return
+  streamConsume = (async () => {
+    let section: TranscriptSection | null = null
+    try {
+      section = await s.next()
+    } catch {
+      section = null
+    }
+    if (stream !== s) return
+    if (section === null) {
+      // Stream finished while speech waited on it: settle the hold state.
+      if (streamHolding) {
+        streamHolding = false
+        clearStatus()
+        updateControlStates(tts.state())
+      }
+      return
+    }
+    appendStreamSection(section)
+    if (streamHolding) {
+      streamHolding = false
+      clearStatus()
+      resumeStreamPlayback()
+    }
+  })().finally(() => {
+    streamConsume = null
+  })
+}
+
+/** Generate ahead when speech nears the end of the ready content. */
+function advanceStream(s: TranscriptStreamHandle, state: TtsState): void {
+  if (s.done()) return
+  if (shouldPrefetchNow(state, streamSections)) {
+    s.prefetch()
+    consumeNextStreamSection(s)
+  }
 }
 
 function readPrefs(): { voiceName: string | null; rate: number } {
@@ -610,7 +852,7 @@ function buildControls(): HTMLDivElement {
   stopBtn = el('button', 'btn', 'Stop')
   stopBtn.type = 'button'
   stopBtn.disabled = true
-  stopBtn.addEventListener('click', () => tts.stop())
+  stopBtn.addEventListener('click', () => stopPlayback())
 
   const nextSentence = el('button', 'btn btn-icon', '›')
   nextSentence.type = 'button'
@@ -785,6 +1027,9 @@ async function startLoad(url: string): Promise<void> {
     return
   }
   clearStatus()
+  // New load supersedes any in-flight stream (also invalidates older loads).
+  abortActiveStream()
+  const myLoad = loadToken
   if (listenBtn) listenBtn.disabled = true
   if (loadingEl) loadingEl.hidden = false
   if (transcriptEl) transcriptEl.hidden = true
@@ -792,6 +1037,7 @@ async function startLoad(url: string): Promise<void> {
   try {
     const token = (await vaultGetSecret('github-token')) ?? ''
     const pr = await fetchPullRequest(ref, token)
+    if (myLoad !== loadToken) return
     // images are best-effort: continue on failure
     const settled = await Promise.allSettled(
       pr.imageUrls.map((u) => fetchImageAsDataUrl(u, token)),
@@ -808,17 +1054,35 @@ async function startLoad(url: string): Promise<void> {
       setStatus(CSP_ENDPOINT_MSG)
       return
     }
+    const visionModel = (lsGet(KEYS.visionModel) ?? '').trim()
     const cfg: LlmConfig = {
+      provider: readProvider(),
       endpoint,
       apiKey: (await vaultGetSecret('llm-api-key')) ?? '',
       model: lsGet(KEYS.model) ?? '',
+      ...(visionModel !== '' ? { visionModel } : {}),
     }
-    const transcript = await buildTranscript(cfg, pr, { imageDataUrls })
-    renderTranscriptView(transcript)
-    tts.load(transcript)
+    if (myLoad !== loadToken) return
+    const title = sanitizeLine(pr.title) || 'Pull request'
+    const s = createTranscriptStream(cfg, pr, { imageDataUrls })
+    stream = s
+    streamSections = []
+    renderStreamTitle(title)
+    tts.load({ title, sections: [] })
     applyPrefs()
+    const first = await s.next()
+    if (myLoad !== loadToken) return
+    if (first === null) {
+      stream = null
+      setStatus('Could not generate a transcript for this pull request.')
+      return
+    }
+    appendStreamSection(first)
     updateControlStates(tts.state())
     if (controlsEl) controlsEl.hidden = false
+    streamStarted = true
+    tts.play()
+    // Later sections arrive via onTtsChange prefetching (advanceStream).
   } catch (err) {
     if (!window.navigator.onLine || err instanceof TypeError) {
       showOfflineBanner()

@@ -96,6 +96,8 @@ export interface TtsPrefs {
 
 export interface TtsController {
   load(transcript: Transcript): void
+  /** Append sections to an already-loaded transcript (streaming). */
+  appendSections(sections: TranscriptSection[]): void
   play(): void
   pause(): void
   resume(): void
@@ -125,10 +127,17 @@ export interface WakeLockController {
 
 // ---------- LLM ----------
 
+export type LlmProvider = 'openai' | 'anthropic' | 'gemini'
+
 export interface LlmConfig {
-  endpoint: string
+  /** API dialect. Default 'openai'. */
+  provider?: LlmProvider
+  /** Base URL. When empty, use the provider's public default. */
+  endpoint?: string
   apiKey: string
   model: string
+  /** Optional separate model for image-bearing calls; falls back to model. */
+  visionModel?: string
 }
 
 export interface LlmMessage {
@@ -136,4 +145,23 @@ export interface LlmMessage {
   text: string
   /** Optional data-URL images attached to this message. */
   images?: string[]
+}
+
+// ---------- Streaming transcript ----------
+
+/**
+ * Lazily-generated transcript: sections arrive as the LLM produces them,
+ * each call carrying only rolling summaries of prior sections (flat context
+ * regardless of PR size). Start speech after the first section.
+ */
+export interface TranscriptStream extends AsyncIterable<TranscriptSection> {
+  /**
+   * Kick off generation of the next section now. Called ahead of need
+   * (speech entering the last ~4 sentences of the last ready section).
+   */
+  prefetch(): void
+  /** True once every section has been emitted. */
+  done(): boolean
+  /** Cancel any in-flight generation and mark the stream done. */
+  abort(): void
 }
