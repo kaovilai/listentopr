@@ -77,16 +77,19 @@ function labeledInput(
   labelText: string,
   type: 'text' | 'password',
   value = '',
-): { wrap: HTMLDivElement; input: HTMLInputElement } {
+): { wrap: HTMLDivElement; input: HTMLInputElement; setLabel: (text: string) => void } {
   const wrap = el('div', 'field')
-  const label = el('label', 'field-label', labelText)
+  const label = el('label', 'field-label')
+  // Span so callers can retext the label without wiping the input child.
+  const labelSpan = el('span', undefined, labelText)
+  label.appendChild(labelSpan)
   const input = el('input', 'field-input')
   input.type = type
   input.autocomplete = 'off'
   input.value = value
   label.appendChild(input)
   wrap.appendChild(label)
-  return { wrap, input }
+  return { wrap, input, setLabel: (text: string) => void (labelSpan.textContent = text) }
 }
 
 // ---------- localStorage helpers (private mode safe) ----------
@@ -103,12 +106,13 @@ const KEYS = {
   wlDismissed: 'listentopr.wl-banner-dismissed',
 } as const
 
-const PROVIDERS: readonly LlmProvider[] = ['openai', 'anthropic', 'gemini']
+const PROVIDERS: readonly LlmProvider[] = ['openai', 'anthropic', 'gemini', 'github']
 
 const PROVIDER_NAMES: ReadonlyArray<readonly [LlmProvider, string]> = [
   ['openai', 'OpenAI'],
   ['anthropic', 'Anthropic'],
   ['gemini', 'Gemini'],
+  ['github', 'GitHub Models'],
 ]
 
 /** Persisted provider choice; 'openai' when unset or invalid. */
@@ -116,6 +120,23 @@ export function readProvider(): LlmProvider {
   const v = lsGet(KEYS.provider)
   return PROVIDERS.includes(v as LlmProvider) ? (v as LlmProvider) : 'openai'
 }
+
+/**
+ * Resolved LLM API key: the explicit llm-api-key when set; the GitHub Models
+ * provider otherwise falls back to the stored GitHub PAT, which doubles as
+ * the model key. Never returns the token for other providers.
+ */
+export function resolveLlmApiKey(
+  provider: LlmProvider,
+  llmKey: string,
+  githubToken: string,
+): string {
+  if (llmKey !== '') return llmKey
+  return provider === 'github' ? githubToken : ''
+}
+
+/** Shown instead of firing an LLM call with an empty GitHub Models Bearer. */
+const GITHUB_KEY_MSG = 'Add a GitHub token in Settings (it doubles as your model key)'
 
 /** Persisted context budget; empty when unset or corrupt. */
 export function readContextBudget(): TranscriptBudget {
@@ -1022,6 +1043,16 @@ function buildSettingsPanel(): HTMLDivElement {
     lsGet(KEYS.visionModel) ?? '',
   )
   const apiKey = labeledInput('LLM API key', 'password')
+
+  // GitHub Models reuses the stored GitHub PAT as its model key, so the key
+  // field is optional there and model ids are namespaced ('openai/gpt-4o').
+  const syncProviderHints = (): void => {
+    const github = providerSelect.value === 'github'
+    apiKey.setLabel(github ? 'LLM API key (optional — uses your GitHub token)' : 'LLM API key')
+    model.input.placeholder = github ? 'openai/gpt-4o' : ''
+  }
+  providerSelect.addEventListener('change', syncProviderHints)
+  syncProviderHints()
 
   // Advanced: context-budget knobs (persisted non-secret in localStorage).
   const savedBudget = readContextBudget()
@@ -2722,13 +2753,22 @@ async function loadPulledPr(
   // proxy controls the page (endpointUsable folds that in).
   const endpointOk = endpointUsable(endpoint, { proxyActive: isProxyActive() })
   const visionModel = (lsGet(KEYS.visionModel) ?? '').trim()
+  const provider = readProvider()
+  // GitHub Models: the explicit LLM key wins, else the GitHub PAT doubles
+  // as the model key (resolveLlmApiKey).
   const cfg: LlmConfig = {
-    provider: readProvider(),
+    provider,
     endpoint,
-    apiKey: (await vaultGetSecret('llm-api-key')) ?? '',
+    apiKey: resolveLlmApiKey(
+      provider,
+      (await vaultGetSecret('llm-api-key')) ?? '',
+      (await vaultGetSecret('github-token')) ?? '',
+    ),
     model: lsGet(KEYS.model) ?? '',
     ...(visionModel !== '' ? { visionModel } : {}),
   }
+  // GitHub Models without any usable key: never send an empty Bearer.
+  const githubKeyMissing = cfg.provider === 'github' && cfg.apiKey === ''
   if (myLoad !== loadToken) return
 
   // ---------- cache hit: instant load, no LLM ----------
@@ -2745,7 +2785,11 @@ async function loadPulledPr(
       if (myLoad !== loadToken) return
       if (shouldBuildDelta(latestSha, headSha) && latestSha !== null) {
         const token = (await vaultGetSecret('github-token')) ?? ''
-        const delta = await buildDelta(ref, pr, latestSha, cfg, token, endpointOk)
+        // Cached transcript still plays when the key is missing; the delta
+        // would fire an LLM call with an empty Bearer, so skip it instead.
+        const delta = githubKeyMissing
+          ? null
+          : await buildDelta(ref, pr, latestSha, cfg, token, endpointOk)
         if (myLoad !== loadToken) return
         if (delta) {
           sections = [delta, ...sections]
@@ -2753,7 +2797,10 @@ async function loadPulledPr(
         }
       }
     }
-    const cacheStatus = fromQueue ? `Up next: ${title}` : 'Loaded from cache'
+    let cacheStatus = fromQueue ? `Up next: ${title}` : 'Loaded from cache'
+    // Delta skipped for a missing GitHub Models key: say why (the cache hit
+    // status below would otherwise swallow the standalone message).
+    if (githubKeyMissing) cacheStatus += ` — ${GITHUB_KEY_MSG}`
     await loadFullTranscript(
       ref,
       headSha,
@@ -2771,6 +2818,10 @@ async function loadPulledPr(
     // would turn the fetch into a TypeError and show a false "offline"
     // banner. Fail with the real cause instead.
     setStatus(CSP_ENDPOINT_MSG)
+    return
+  }
+  if (githubKeyMissing) {
+    setStatus(GITHUB_KEY_MSG)
     return
   }
   // images are best-effort: continue on failure

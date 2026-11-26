@@ -162,7 +162,8 @@ export interface WakeLockController {
 
 // ---------- LLM ----------
 
-export type LlmProvider = 'openai' | 'anthropic' | 'gemini'
+/** 'github' = GitHub Models (models.github.ai): OpenAI dialect, reuses the stored GitHub PAT. */
+export type LlmProvider = 'openai' | 'anthropic' | 'gemini' | 'github'
 
 export interface LlmConfig {
   /** API dialect. Default 'openai'. */

@@ -100,11 +100,12 @@ describe('chat timeout coverage', () => {
 // ---------------------------------------------------------------------------
 
 describe('PROVIDER_DEFAULT_ENDPOINTS', () => {
-  it('exposes the public defaults for all three providers', () => {
+  it('exposes the public defaults for all four providers', () => {
     expect(PROVIDER_DEFAULT_ENDPOINTS).toEqual({
       openai: 'https://api.openai.com/v1',
       anthropic: 'https://api.anthropic.com',
       gemini: 'https://generativelanguage.googleapis.com',
+      github: 'https://models.github.ai',
     })
   })
 })
@@ -251,6 +252,105 @@ describe('openai adapter', () => {
     await expect(chat(providerConfig('openai'), [{ role: 'user', text: 'hi' }])).rejects.toThrow(
       'LLM returned no message content',
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GitHub Models adapter (OpenAI dialect over models.github.ai, PAT as Bearer)
+// ---------------------------------------------------------------------------
+
+describe('github adapter', () => {
+  it('empty endpoint falls back to the GitHub Models default with the /inference path', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    await chat(providerConfig('github', { endpoint: '' }), [{ role: 'user', text: 'hi' }])
+    expect(lastCall(mock).url).toBe('https://models.github.ai/inference/chat/completions')
+  })
+
+  it('posts to {base}/inference/chat/completions with the PAT as a Bearer token', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'hello' } }] })
+    const result = await chat(
+      providerConfig('github', { endpoint: 'https://models.github.ai', apiKey: 'ghp_pat-secret' }),
+      [{ role: 'user', text: 'hi' }],
+    )
+    const { url, init } = lastCall(mock)
+    expect(url).toBe('https://models.github.ai/inference/chat/completions')
+    expect(init.method).toBe('POST')
+    const headers = init.headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer ghp_pat-secret')
+    expect(headers['Content-Type']).toBe('application/json')
+    expect(headers['x-api-key']).toBeUndefined()
+    expect(result).toBe('hello')
+  })
+
+  it('endpoint already ending in /inference gets only /chat/completions (no double /inference)', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    await chat(providerConfig('github', { endpoint: 'https://models.github.ai/inference' }), [
+      { role: 'user', text: 'hi' },
+    ])
+    expect(lastCall(mock).url).toBe('https://models.github.ai/inference/chat/completions')
+  })
+
+  it('endpoint with trailing slash (bare or /inference) still yields one /inference/chat/completions', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    await chat(providerConfig('github', { endpoint: 'https://models.github.ai/' }), [
+      { role: 'user', text: 'hi' },
+    ])
+    expect(lastCall(mock).url).toBe('https://models.github.ai/inference/chat/completions')
+
+    await chat(providerConfig('github', { endpoint: 'https://models.github.ai/inference/' }), [
+      { role: 'user', text: 'hi' },
+    ])
+    expect(lastCall(mock).url).toBe('https://models.github.ai/inference/chat/completions')
+  })
+
+  it('sends the OpenAI body shape: namespaced model id verbatim, image_url parts after the text part', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    const messages: LlmMessage[] = [
+      { role: 'user', text: 'look', images: [PNG_DATA_URL, 'https://example.com/cat.png'] },
+    ]
+    await chat(providerConfig('github', { model: 'openai/gpt-4o' }), messages)
+    expect(sentBody(mock)).toEqual({
+      model: 'openai/gpt-4o',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'look' },
+            { type: 'image_url', image_url: { url: PNG_DATA_URL } },
+            { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } },
+          ],
+        },
+      ],
+    })
+  })
+
+  it('image-bearing call uses visionModel; text-only call keeps the primary model', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    await chat(providerConfig('github', { model: 'openai/gpt-4o', visionModel: 'openai/gpt-4o-mini' }), [
+      { role: 'user', text: 'look', images: [PNG_DATA_URL] },
+    ])
+    expect(sentBody(mock).model).toBe('openai/gpt-4o-mini')
+
+    await chat(providerConfig('github', { model: 'openai/gpt-4o', visionModel: 'openai/gpt-4o-mini' }), [
+      { role: 'user', text: 'hi' },
+    ])
+    expect(sentBody(mock).model).toBe('openai/gpt-4o')
+  })
+
+  it('redacts the PAT from an error body', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response('bad token ghp_pat-secret rejected', { status: 401 }))),
+    )
+    const err = await chat(
+      providerConfig('github', { endpoint: 'https://models.github.ai', apiKey: 'ghp_pat-secret' }),
+      [{ role: 'user', text: 'hi' }],
+    ).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(LlmError)
+    const llmErr = err as LlmError
+    expect(llmErr.status).toBe(401)
+    expect(llmErr.body).toBe('bad token [redacted] rejected')
+    expect(llmErr.message).not.toContain('ghp_pat-secret')
   })
 })
 

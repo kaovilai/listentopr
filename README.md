@@ -130,10 +130,19 @@ key (stored encrypted in the vault). Provider defaults:
 
 | Setting | Values / default | Notes |
 | --- | --- | --- |
-| Provider | `openai` (default), `anthropic`, `gemini` | API dialect used by `src/llm.ts` |
-| Endpoint | empty = provider default | OpenAI `https://api.openai.com/v1` (`/chat/completions`), Anthropic `https://api.anthropic.com` (`/v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01`), Gemini `https://generativelanguage.googleapis.com` (`/v1beta/models/{model}:generateContent?key=`) |
+| Provider | `openai` (default), `anthropic`, `gemini`, `github` | API dialect used by `src/llm.ts` |
+| Endpoint | empty = provider default | OpenAI `https://api.openai.com/v1` (`/chat/completions`), Anthropic `https://api.anthropic.com` (`/v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01`), Gemini `https://generativelanguage.googleapis.com` (`/v1beta/models/{model}:generateContent?key=`), GitHub Models `https://models.github.ai` (`/inference/chat/completions`) |
 | Model | any model id the provider accepts | used for text-only calls |
 | Vision model | optional | used only for image-bearing calls (the architecture section); falls back to Model |
+
+**GitHub Models** (`provider: github`) speaks the OpenAI dialect against
+`https://models.github.ai` (`/inference/chat/completions`) and authenticates
+with your GitHub personal access token as a Bearer — no separate API key
+needed: when no `llm-api-key` is stored, the vault's GitHub token doubles as
+the model key (an explicit `llm-api-key` still wins). Model ids are
+namespaced like `openai/gpt-4o` (Settings hints this in the model field's
+placeholder). Vision works through the Vision model field (`visionModel`),
+same as other providers.
 
 Additionally, the CSP `connect-src` allow-list can bake an endpoint in at
 build time so production builds can talk to it:
@@ -356,7 +365,7 @@ modes (`light` → Light, anything unknown → Auto).
 | Service-worker LLM proxy for CSP-blocked custom endpoints | `src/llmproxy.ts` (`llmProxyFetch`, `isProxyActive`), `src/csp.ts` (`endpointUsable`), `public/sw.js` |
 | Ephemeral vault mode + persist-to-PIN/PRF migration | `src/vault.ts` (`mode`, `persistToPin`, `persistToPrf`, `hasSecrets`) |
 | Token redaction in errors | `src/github.ts` (`sanitizeError`), `src/llm.ts` (key redaction) |
-| Multi-provider chat client (OpenAI/Anthropic/Gemini), timeout, abort, key redaction | `src/llm.ts` (`chat`, `PROVIDER_DEFAULT_ENDPOINTS`, 120s default) |
+| Multi-provider chat client (OpenAI/Anthropic/Gemini/GitHub Models), timeout, abort, key redaction | `src/llm.ts` (`chat`, `PROVIDER_DEFAULT_ENDPOINTS`, 120s default) |
 | Speech-safe sanitization (markdown, hunks, SHAs, URLs, symbols) | `src/transcript.ts` (`sanitizeLine`) |
 | Sentence splitting (abbreviations, decimals, 250-char chunking) | `src/transcript.ts` (`splitSentences`) |
 | Streaming transcript (per-section LLM calls, rolling summaries, abort, fallbacks) | `src/transcript.ts` (`createTranscriptStream`) |

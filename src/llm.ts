@@ -1,4 +1,4 @@
-// Multi-provider chat client for ListenToPR (openai / anthropic / gemini).
+// Multi-provider chat client for ListenToPR (openai / anthropic / gemini / github).
 import type { LlmConfig, LlmMessage, LlmProvider } from './types'
 
 /** Typed error thrown by chat(): carries HTTP status and a sanitized body. */
@@ -32,6 +32,7 @@ export const PROVIDER_DEFAULT_ENDPOINTS: Record<LlmProvider, string> = {
   openai: 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com',
   gemini: 'https://generativelanguage.googleapis.com',
+  github: 'https://models.github.ai',
 }
 
 function providerOf(config: LlmConfig): LlmProvider {
@@ -112,7 +113,20 @@ interface OpenAiResponseBody {
   choices?: Array<{ message?: { content?: unknown } }>
 }
 
-function openaiRequest(config: LlmConfig, messages: LlmMessage[]): PreparedRequest {
+/**
+ * GitHub Models path: exactly one '/inference/chat/completions', even when
+ * the endpoint already ends with /inference (models.github.ai serves its
+ * OpenAI-dialect API under /inference).
+ */
+function githubUrl(base: string): string {
+  return `${base.endsWith('/inference') ? base : `${base}/inference`}/chat/completions`
+}
+
+function openaiRequest(
+  config: LlmConfig,
+  messages: LlmMessage[],
+  provider: LlmProvider,
+): PreparedRequest {
   const model = resolveModel(config, callHasImages(messages))
   const requestMessages = messages.map((m) => {
     if (!m.images || m.images.length === 0) {
@@ -124,8 +138,9 @@ function openaiRequest(config: LlmConfig, messages: LlmMessage[]): PreparedReque
     }
     return { role: m.role, content }
   })
+  const base = baseOf(config, provider)
   return {
-    url: `${baseOf(config, 'openai')}/chat/completions`,
+    url: provider === 'github' ? githubUrl(base) : `${base}/chat/completions`,
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${config.apiKey}`,
@@ -341,7 +356,7 @@ export async function chat(
       ? anthropicRequest(config, messages)
       : provider === 'gemini'
         ? geminiRequest(config, messages)
-        : openaiRequest(config, messages)
+        : openaiRequest(config, messages, provider)
   const { status, data } = await postJson(config, request, opts)
   const text =
     provider === 'anthropic'

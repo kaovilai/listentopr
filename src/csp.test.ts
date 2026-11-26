@@ -14,10 +14,10 @@ import {
 const SHIPPED_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
   "img-src 'self' data: https:; " +
-  "connect-src 'self' https://api.github.com https://github.com https://*.githubusercontent.com https://api.example.com; " +
+  "connect-src 'self' https://api.github.com https://github.com https://*.githubusercontent.com https://models.github.ai https://api.example.com; " +
   "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
-const SHIPPED_CONNECT_SRC = "'self' https://api.github.com https://github.com https://*.githubusercontent.com https://api.example.com"
+const SHIPPED_CONNECT_SRC = "'self' https://api.github.com https://github.com https://*.githubusercontent.com https://models.github.ai https://api.example.com"
 
 describe('connectSrcValue', () => {
   it('extracts the connect-src directive from a full CSP', () => {
@@ -64,6 +64,15 @@ describe('endpointAllowedByConnectSrc', () => {
       endpointAllowedByConnectSrc('https://avatars.githubusercontent.com', SHIPPED_CONNECT_SRC, selfOrigin),
     ).toBe(true)
     expect(endpointAllowedByConnectSrc('https://github.com', SHIPPED_CONNECT_SRC, selfOrigin)).toBe(true)
+  })
+
+  it('allows the GitHub Models origin (github provider default endpoint)', () => {
+    expect(
+      endpointAllowedByConnectSrc('https://models.github.ai', SHIPPED_CONNECT_SRC, selfOrigin),
+    ).toBe(true)
+    expect(
+      endpointAllowedByConnectSrc('https://models.github.ai/inference', SHIPPED_CONNECT_SRC, selfOrigin),
+    ).toBe(true)
   })
 
   it('rejects an endpoint origin absent from connect-src', () => {

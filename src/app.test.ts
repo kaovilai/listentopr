@@ -171,10 +171,30 @@ describe('readProvider', () => {
   })
 
   it('returns each persisted valid provider', () => {
-    for (const provider of ['openai', 'anthropic', 'gemini'] as const) {
+    for (const provider of ['openai', 'anthropic', 'gemini', 'github'] as const) {
       storage.set('listentopr.llm-provider', provider)
       expect(app.readProvider()).toBe(provider)
     }
+  })
+})
+
+describe('resolveLlmApiKey', () => {
+  it('prefers the explicit LLM key when set, for every provider', () => {
+    for (const provider of ['openai', 'anthropic', 'gemini', 'github'] as const) {
+      expect(app.resolveLlmApiKey(provider, 'sk-llm', 'ghp_token')).toBe('sk-llm')
+    }
+  })
+
+  it('falls back to the GitHub token only for the github provider', () => {
+    expect(app.resolveLlmApiKey('github', '', 'ghp_token')).toBe('ghp_token')
+    expect(app.resolveLlmApiKey('openai', '', 'ghp_token')).toBe('')
+    expect(app.resolveLlmApiKey('anthropic', '', 'ghp_token')).toBe('')
+    expect(app.resolveLlmApiKey('gemini', '', 'ghp_token')).toBe('')
+  })
+
+  it('is empty when both secrets are empty', () => {
+    expect(app.resolveLlmApiKey('github', '', '')).toBe('')
+    expect(app.resolveLlmApiKey('openai', '', '')).toBe('')
   })
 })
 
