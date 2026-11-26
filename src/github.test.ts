@@ -387,6 +387,53 @@ describe('fetchPullRequest', () => {
     }
   })
 
+  it('sends no Authorization header when the token is empty (public unauthenticated path)', async () => {
+    const routes: Record<string, MockRes> = {
+      'https://api.github.com/repos/octo/repo/pulls/7': jsonRes({
+        title: 't',
+        body: '',
+        user: { login: 'u' },
+      }),
+      [`https://api.github.com/repos/octo/repo/pulls/7/files?${FILES_Q}`]: jsonRes([]),
+      [`https://api.github.com/repos/octo/repo/pulls/7/comments?${FILES_Q}`]: jsonRes([]),
+      [`https://api.github.com/repos/octo/repo/pulls/7/reviews?${FILES_Q}`]: jsonRes([]),
+      [`https://api.github.com/repos/octo/repo/issues/7/comments?${FILES_Q}`]: jsonRes([]),
+    }
+    fetchMock.mockImplementation((url: string) => {
+      const r = routes[url]
+      if (r !== undefined) return Promise.resolve(r)
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+
+    await fetchPullRequest(REF, '')
+
+    // An empty bearer would earn a misleading 401 "Bad credentials";
+    // the header must be absent entirely.
+    for (const call of fetchMock.mock.calls) {
+      const init = call[1] as { headers: Record<string, string> }
+      expect(init.headers.Authorization).toBeUndefined()
+      expect(init.headers.Accept).toBe('application/vnd.github+json')
+    }
+  })
+
+  it('maps a 401 with a saved token to an actionable re-save message', async () => {
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(jsonRes({ message: 'Bad credentials' }, { status: 401 }))
+    )
+    await expect(fetchPullRequest(REF, TOKEN)).rejects.toThrow(
+      /rejected the saved token.*re-save in Settings/u
+    )
+  })
+
+  it('maps a 401 without a token to an actionable add-token message', async () => {
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(jsonRes({ message: 'Bad credentials' }, { status: 401 }))
+    )
+    await expect(fetchPullRequest(REF, '')).rejects.toThrow(
+      /requires a token for this request/u
+    )
+  })
+
   it('follows Link rel=next headers when paginating files', async () => {
     const page1 = Array.from({ length: 100 }, (_, i) => fileEntry(`src/f${i}.ts`))
     const page2 = Array.from({ length: 50 }, (_, i) => fileEntry(`src/g${i}.ts`))

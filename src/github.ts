@@ -131,6 +131,10 @@ export function extractMermaidBlocks(text: string): string[] {
 // ---------- Fetch plumbing ----------
 
 function ghHeaders(token: string): Record<string, string> {
+  // An EMPTY bearer is worse than no header: GitHub answers it with a
+  // misleading 401 "Bad credentials" instead of "Requires authentication".
+  // No token = unauthenticated request (works for public PRs, 60 req/h).
+  if (token === '') return { Accept: 'application/vnd.github+json' }
   return { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' }
 }
 
@@ -151,7 +155,15 @@ async function httpError(res: Response, url: string, token: string): Promise<Err
   } catch {
     // non-JSON error body; status alone is enough
   }
-  const msg = `GitHub API request failed (${res.status}) for ${url}${detail === '' ? '' : `: ${detail}`}`
+  let msg = `GitHub API request failed (${res.status}) for ${url}${detail === '' ? '' : `: ${detail}`}`
+  if (res.status === 401) {
+    // Distinguish "no token sent" from "token sent but rejected" so the
+    // user gets an actionable message instead of a bare "Bad credentials".
+    msg =
+      token === ''
+        ? `GitHub requires a token for this request (${url}). Public repos also work without one — if this repo is private, add a PAT in Settings.`
+        : `GitHub rejected the saved token (401, ${detail || 'Bad credentials'}). Re-check it and re-save in Settings — a token saved under one unlock method (PIN vs biometrics) cannot be read after unlocking with another.`
+  }
   return sanitizeError(new Error(msg), token)
 }
 
