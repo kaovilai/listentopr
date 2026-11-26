@@ -240,6 +240,17 @@ h3 {
   color: var(--muted);
 }
 
+/* GitHub Models catalog picker: refresh button + status hint inside the
+   model field (the pickers are .select elements toggled against the inputs). */
+.catalog-refresh {
+  align-self: flex-start;
+}
+
+.catalog-hint {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
 .pr-form {
   display: flex;
   gap: var(--space-2);

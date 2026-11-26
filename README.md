@@ -144,6 +144,20 @@ namespaced like `openai/gpt-4o` (Settings hints this in the model field's
 placeholder). Vision works through the Vision model field (`visionModel`),
 same as other providers.
 
+With GitHub Models selected, Settings turns the model and vision-model
+fields into live pickers: opening Settings loads the model catalog from
+`https://models.github.ai/catalog/models` (same token as the Bearer) and
+groups it by publisher — each option shows `name (id)` with the catalog
+summary on hover, and the vision picker lists only vision-capable models.
+The list is cached in localStorage for 24 hours, so repeat opens are
+instant and work offline; **Refresh models** forces a re-fetch. A
+**Custom…** option switches back to the free-text input for arbitrary model
+ids (remembered for the session only), and if the catalog cannot be loaded
+(no token yet, a 401, or offline) the fields fall back to plain text inputs
+with the reason shown. Picking a model with a known input limit auto-fills
+the Advanced context-window field when it is empty. Fine-grained PATs need
+the `models: read` permission for the catalog to load.
+
 Additionally, the CSP `connect-src` allow-list can bake an endpoint in at
 build time so production builds can talk to it:
 

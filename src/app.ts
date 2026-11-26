@@ -27,6 +27,13 @@ import {
   type TranscriptStreamHandle,
 } from './transcript'
 import { chat } from './llm'
+import {
+  createCatalogCache,
+  fetchModelCatalog,
+  groupByPublisher,
+  type CatalogModel,
+  type CatalogStorage,
+} from './modelcatalog'
 import { createTtsController, listVoices } from './tts'
 import { createWakeLockController, shouldShowWakeLockFallback } from './wakelock'
 import { createUpdateController, type UpdateController } from './update'
@@ -137,6 +144,60 @@ export function resolveLlmApiKey(
 
 /** Shown instead of firing an LLM call with an empty GitHub Models Bearer. */
 const GITHUB_KEY_MSG = 'Add a GitHub token in Settings (it doubles as your model key)'
+
+// ---------- GitHub Models catalog picker decision ----------
+
+/** Cache entry shape the model-picker decision helper reads. */
+export interface ModelCatalogEntry {
+  models: CatalogModel[]
+  fetchedAt: number
+}
+
+/** How the GitHub Models picker got its model list, or why it could not. */
+export type ModelCatalogOutcome =
+  | { kind: 'cache'; models: CatalogModel[] }
+  | { kind: 'fetch'; models: CatalogModel[] }
+  | { kind: 'fallback'; reason: string }
+
+/** Injectable seams for the model-picker decision (tests use fakes). */
+export interface ModelCatalogDeps {
+  readCache(): ModelCatalogEntry | null
+  writeCache(models: CatalogModel[]): void
+  fetchCatalog(token: string): Promise<CatalogModel[]>
+}
+
+/**
+ * Decide how the GitHub Models picker populates its selects. A cache hit
+ * (createCatalogCache.read only returns fresh entries — stale ones read as
+ * null, so stale means fetch) is served with no network call; a miss fetches
+ * and re-caches on success; any failure, including an empty token, degrades
+ * to the free-text input with the reason surfaced to the user.
+ */
+export async function resolveModelCatalog(
+  token: string,
+  deps: ModelCatalogDeps,
+): Promise<ModelCatalogOutcome> {
+  if (token === '') return { kind: 'fallback', reason: 'no token' }
+  const cached = deps.readCache()
+  if (cached !== null) return { kind: 'cache', models: cached.models }
+  let models: CatalogModel[]
+  try {
+    models = await deps.fetchCatalog(token)
+  } catch (err) {
+    return { kind: 'fallback', reason: sanitizeError(err) }
+  }
+  deps.writeCache(models)
+  return { kind: 'fetch', models }
+}
+
+/** localStorage handle for the catalog cache; inert when storage is blocked. */
+function catalogStorage(): CatalogStorage {
+  try {
+    return window.localStorage
+  } catch {
+    return { getItem: () => null, setItem: () => {} }
+  }
+}
 
 /** Persisted context budget; empty when unset or corrupt. */
 export function readContextBudget(): TranscriptBudget {
@@ -260,6 +321,9 @@ let vaultEphemeral = false
 let currentFileTarget: GitFileTarget | null = null
 /** One-time-per-session hint that a custom endpoint goes via the SW proxy. */
 let proxyHintShown = false
+/** Session-only 'Custom…' choices for the GitHub Models pickers (reload resets). */
+let modelPickerCustom = false
+let visionPickerCustom = false
 /** True between "playback started" and natural stop/finish. */
 let playbackActive = false
 /** Timestamp of the last throttled resume-position write. */
@@ -986,6 +1050,9 @@ function showLocked(): void {
 /** Current voiceschanged handler for the settings voice preview, so a re-render replaces the previous one. */
 let voicePreviewHandler: (() => void) | null = null
 
+/** Set by buildSettingsPanel; fired each time the settings panel opens. */
+let settingsOpenHook: (() => void) | null = null
+
 /** Speak "This is how I sound." with a voice, at the current rate and pitch. */
 function speakVoicePreview(voiceName: string): void {
   try {
@@ -1086,6 +1153,168 @@ function buildSettingsPanel(): HTMLDivElement {
   detailBox.checked = readDetail() === 'detailed'
   detailLabel.appendChild(detailBox)
   detailWrap.appendChild(detailLabel)
+
+  // ---------- GitHub Models live catalog picker ----------
+  // With provider = GitHub Models the model and vision-model fields become
+  // selects fed by the live catalog (models.github.ai), options grouped by
+  // publisher, label 'name (id)', summary on hover. 'Custom…' flips back to
+  // the free-text input (remembered for the session only). Any load failure
+  // falls back to the plain text inputs with the reason shown; the rest of
+  // Settings keeps working throughout.
+  const CUSTOM_OPTION = '__custom__'
+
+  const modelSelect = el('select', 'select')
+  const visionSelect = el('select', 'select')
+  modelSelect.hidden = true
+  visionSelect.hidden = true
+  modelSelect.setAttribute('aria-label', 'LLM model')
+  visionSelect.setAttribute('aria-label', 'Vision model')
+  const refreshModelsBtn = el('button', 'btn btn-small catalog-refresh', 'Refresh models')
+  refreshModelsBtn.type = 'button'
+  const catalogHint = el('p', 'muted catalog-hint')
+  catalogHint.hidden = true
+  catalogHint.setAttribute('role', 'status')
+  catalogHint.setAttribute('aria-live', 'polite')
+
+  /** Models from the last successful catalog load (cache or fetch). */
+  let catalogModels: CatalogModel[] = []
+  /** Bumped per catalog load so a superseded async result cannot clobber a newer one. */
+  let catalogLoadSeq = 0
+
+  /** Populate one picker select; visionOnly keeps just vision-capable models. */
+  function fillCatalogSelect(
+    select: HTMLSelectElement,
+    visionOnly: boolean,
+    currentId: string,
+  ): void {
+    select.textContent = ''
+    const pool = visionOnly ? catalogModels.filter((m) => m.vision) : catalogModels
+    const listed = new Set(pool.map((m) => m.id))
+    if (currentId === '') {
+      const ph = el('option', undefined, visionOnly ? 'Select a vision model…' : 'Select a model…')
+      ph.value = ''
+      select.appendChild(ph)
+    } else if (!listed.has(currentId)) {
+      // Keep the persisted id selectable even when the catalog no longer lists it.
+      const opt = el('option', undefined, `${currentId} (not in catalog)`)
+      opt.value = currentId
+      select.appendChild(opt)
+    }
+    for (const group of groupByPublisher(pool)) {
+      const og = el('optgroup')
+      og.label = group.publisher
+      for (const m of group.models) {
+        const opt = el('option', undefined, `${m.name} (${m.id})`)
+        opt.value = m.id
+        opt.title = m.summary
+        og.appendChild(opt)
+      }
+      select.appendChild(og)
+    }
+    const custom = el('option', undefined, 'Custom…')
+    custom.value = CUSTOM_OPTION
+    select.appendChild(custom)
+    select.value = currentId
+  }
+
+  /** Show selects vs text inputs per provider, loaded models, and Custom choices. */
+  function syncModelPickerVisibility(): void {
+    const useSelects = providerSelect.value === 'github' && catalogModels.length > 0
+    modelSelect.hidden = !useSelects || modelPickerCustom
+    model.input.hidden = useSelects && !modelPickerCustom
+    visionSelect.hidden = !useSelects || visionPickerCustom
+    visionModel.input.hidden = useSelects && !visionPickerCustom
+    refreshModelsBtn.hidden = providerSelect.value !== 'github'
+  }
+
+  /**
+   * Wire one picker select: 'Custom…' switches to the free-text input for
+   * this session; a catalog pick syncs the hidden input (the persisted key)
+   * and auto-fills the context window from the model's input-token limit —
+   * only while the user has not set one. Picking a vision-capable model into
+   * the MAIN model field never touches the vision-model field.
+   */
+  function wireCatalogSelect(
+    select: HTMLSelectElement,
+    input: HTMLInputElement,
+    visionOnly: boolean,
+  ): void {
+    select.addEventListener('change', () => {
+      if (select.value === CUSTOM_OPTION) {
+        if (visionOnly) visionPickerCustom = true
+        else modelPickerCustom = true
+        select.hidden = true
+        input.hidden = false
+        input.focus()
+        return
+      }
+      input.value = select.value
+      if (contextWindow.input.value.trim() === '') {
+        const m = catalogModels.find((c) => c.id === select.value)
+        if (m && m.maxInputTokens !== null) {
+          contextWindow.input.value = String(m.maxInputTokens)
+        }
+      }
+    })
+  }
+  wireCatalogSelect(modelSelect, model.input, false)
+  wireCatalogSelect(visionSelect, visionModel.input, true)
+
+  function applyCatalogModels(models: CatalogModel[]): void {
+    catalogModels = models
+    fillCatalogSelect(modelSelect, false, model.input.value.trim())
+    fillCatalogSelect(visionSelect, true, visionModel.input.value.trim())
+    syncModelPickerVisibility()
+  }
+
+  /**
+   * Cache-first catalog population (force = refresh button: skip the cache
+   * read, still re-cache the result). Never blocks the rest of Settings:
+   * everything async, stale results dropped via catalogLoadSeq.
+   */
+  async function loadCatalog(force: boolean): Promise<void> {
+    if (providerSelect.value !== 'github') return
+    const mySeq = ++catalogLoadSeq
+    catalogHint.textContent = 'Loading models…'
+    catalogHint.hidden = false
+    // The model key for the github provider: explicit llm-api-key ?? GitHub PAT.
+    const llmKey = (await vaultGetSecret('llm-api-key')) ?? ''
+    const ghToken = (await vaultGetSecret('github-token')) ?? ''
+    const token = resolveLlmApiKey('github', llmKey, ghToken)
+    const cache = createCatalogCache(catalogStorage())
+    const outcome = await resolveModelCatalog(token, {
+      readCache: force ? () => null : cache.read,
+      writeCache: cache.write,
+      fetchCatalog: (t) => fetchModelCatalog(t),
+    })
+    if (mySeq !== catalogLoadSeq) return
+    if (outcome.kind === 'fallback') {
+      catalogModels = []
+      syncModelPickerVisibility()
+      catalogHint.textContent = `Could not load model list (${outcome.reason}) — type a model id`
+      catalogHint.hidden = false
+      return
+    }
+    catalogHint.hidden = true
+    applyCatalogModels(outcome.models)
+  }
+
+  refreshModelsBtn.addEventListener('click', () => {
+    void loadCatalog(true)
+  })
+  providerSelect.addEventListener('change', () => {
+    syncModelPickerVisibility()
+    if (providerSelect.value === 'github' && catalogModels.length === 0) void loadCatalog(false)
+  })
+  syncModelPickerVisibility()
+  settingsOpenHook = () => {
+    void loadCatalog(false)
+  }
+
+  model.wrap.appendChild(modelSelect)
+  model.wrap.appendChild(refreshModelsBtn)
+  model.wrap.appendChild(catalogHint)
+  visionModel.wrap.appendChild(visionSelect)
 
   const autoLock = el(
     'p',
@@ -2377,6 +2606,8 @@ function showMain(): void {
   const settingsPanel = buildSettingsPanel()
   settingsBtn.addEventListener('click', () => {
     settingsPanel.hidden = !settingsPanel.hidden
+    // Opening Settings with the github provider populates the model pickers.
+    if (!settingsPanel.hidden) settingsOpenHook?.()
   })
 
   const main = el('main', 'main')

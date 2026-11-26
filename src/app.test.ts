@@ -732,3 +732,81 @@ describe('pinOnlyVaultMessage', () => {
     expect(msg).toContain('Wipe vault and start fresh')
   })
 })
+
+describe('resolveModelCatalog', () => {
+  const models: import('./modelcatalog').CatalogModel[] = [
+    {
+      id: 'openai/gpt-4o',
+      name: 'GPT-4o',
+      publisher: 'OpenAI',
+      summary: 'Multimodal flagship',
+      vision: true,
+      maxInputTokens: 128000,
+      rateLimitTier: null,
+    },
+    {
+      id: 'meta/llama-4-scout',
+      name: 'Llama 4 Scout',
+      publisher: 'Meta',
+      summary: '',
+      vision: false,
+      maxInputTokens: null,
+      rateLimitTier: 'low',
+    },
+  ]
+
+  it('serves a fresh cache entry without fetching', async () => {
+    const fetchCatalog = vi.fn()
+    const writeCache = vi.fn()
+    const out = await app.resolveModelCatalog('ghp_x', {
+      readCache: () => ({ models, fetchedAt: Date.now() }),
+      writeCache,
+      fetchCatalog,
+    })
+    expect(out).toEqual({ kind: 'cache', models })
+    expect(fetchCatalog).not.toHaveBeenCalled()
+    expect(writeCache).not.toHaveBeenCalled()
+  })
+
+  it('fetches on a stale or missing cache entry and caches the result', async () => {
+    // createCatalogCache.read returns null once the 24h TTL passed, so a
+    // stale entry reads exactly like a miss: the picker must re-fetch.
+    const fetchCatalog = vi.fn().mockResolvedValue(models)
+    const writeCache = vi.fn()
+    const out = await app.resolveModelCatalog('ghp_x', {
+      readCache: () => null,
+      writeCache,
+      fetchCatalog,
+    })
+    expect(out).toEqual({ kind: 'fetch', models })
+    expect(fetchCatalog).toHaveBeenCalledTimes(1)
+    expect(fetchCatalog).toHaveBeenCalledWith('ghp_x')
+    expect(writeCache).toHaveBeenCalledWith(models)
+  })
+
+  it('falls back with the reason when the fetch fails, and does not cache', async () => {
+    const fetchCatalog = vi.fn().mockRejectedValue(new Error('GitHub Models catalog request failed (401)'))
+    const writeCache = vi.fn()
+    const out = await app.resolveModelCatalog('ghp_x', {
+      readCache: () => null,
+      writeCache,
+      fetchCatalog,
+    })
+    expect(out.kind).toBe('fallback')
+    if (out.kind === 'fallback') expect(out.reason).toContain('(401)')
+    expect(writeCache).not.toHaveBeenCalled()
+  })
+
+  it('falls back with "no token" before reading the cache or fetching', async () => {
+    const readCache = vi.fn()
+    const fetchCatalog = vi.fn()
+    const out = await app.resolveModelCatalog('', {
+      readCache,
+      writeCache: () => {},
+      fetchCatalog,
+    })
+    expect(out).toEqual({ kind: 'fallback', reason: 'no token' })
+    expect(readCache).not.toHaveBeenCalled()
+    expect(fetchCatalog).not.toHaveBeenCalled()
+  })
+})
