@@ -38,6 +38,13 @@ export interface PullRequestData {
   additions: number
   deletions: number
   changedFiles: number
+  /**
+   * Raw changed-file count reported by the API before generated-file
+   * filtering. When greater than changedFiles, the app tells the listener
+   * how many files were skipped (lockfiles, build output). Absent for
+   * pseudo-PR sources (pasted text, file content).
+   */
+  rawChangedFiles?: number
   files: PrFile[]
   comments: PrComment[]
   reviews: PrReview[]
@@ -53,7 +60,12 @@ export interface TranscriptSection {
   id: string
   title: string
   sentences: string[]
+  /** Filenames the section discusses (max 8, verbatim from the call's input). */
+  files?: string[]
 }
+
+/** Section verbosity: 'brief' (default) walks changes by intent; 'detailed' states per-file removals/additions. */
+export type TranscriptDetail = 'brief' | 'detailed'
 
 export interface Transcript {
   title: string
@@ -80,6 +92,14 @@ export interface VaultOptions {
   dbName?: string
   /** Idle auto-lock in ms; 0 disables. Default 15 min. */
   idleTimeoutMs?: number
+  /**
+   * 'ephemeral': session-only vault — no PIN/PRF gate, secrets live only in
+   * an in-memory Map, IndexedDB is never touched. 'persistent' (default):
+   * current behavior — PIN/PRF-gated, AES-GCM-encrypted IndexedDB records.
+   */
+  mode?: 'ephemeral' | 'persistent'
+  /** IndexedDB factory override (dependency injection; defaults to the global). */
+  idbFactory?: IDBFactory
 }
 
 // ---------- TTS ----------

@@ -19,6 +19,12 @@ export interface ChatOptions {
   timeoutMs?: number
   /** Optional external abort signal, combined with the timeout. */
   signal?: AbortSignal
+  /**
+   * Fetch implementation used for the request. Defaults to the global fetch.
+   * The app passes the service-worker LLM proxy fetch here so custom
+   * endpoints bypass the page CSP (see src/llmproxy.ts).
+   */
+  fetch?: (url: string, init?: RequestInit) => Promise<Response>
 }
 
 /** Public default base URLs per provider; used when config.endpoint is empty. */
@@ -280,7 +286,7 @@ async function postJson(
 
   let response: Response
   try {
-    response = await fetch(request.url, {
+    response = await (opts.fetch ?? fetch)(request.url, {
       method: 'POST',
       headers: request.headers,
       body: request.body,

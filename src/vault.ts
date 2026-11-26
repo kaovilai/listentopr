@@ -74,6 +74,14 @@ export class Vault {
   private dbPromise: Promise<IDBDatabase> | null = null
   private readonly dbName: string
   private readonly idleTimeoutMs: number
+  /** 'ephemeral': session-only in-memory secrets, no gate, no IndexedDB. */
+  private mode: 'ephemeral' | 'persistent'
+  /** Plaintext secrets for ephemeral mode; cleared by lock()/wipeAll(). */
+  private readonly ephemeralSecrets = new Map<SecretId, string>()
+  /** Ephemeral unlock flag (true from construction until lock()). */
+  private ephemeralUnlocked: boolean
+  /** Injectable IDB factory; the global indexedDB when not overridden. */
+  private readonly idbFactory: IDBFactory | null
   private timer: ReturnType<typeof setTimeout> | null = null
   private disposed = false
   private readonly changeSubs = new Set<() => void>()
@@ -82,10 +90,13 @@ export class Vault {
   constructor(options: VaultOptions = {}) {
     this.dbName = options.dbName ?? 'listentopr-vault'
     this.idleTimeoutMs = options.idleTimeoutMs ?? 15 * 60 * 1000
+    this.mode = options.mode ?? 'persistent'
+    this.idbFactory = options.idbFactory ?? null
+    this.ephemeralUnlocked = this.mode === 'ephemeral'
   }
 
   isUnlocked(): boolean {
-    return this.key !== null
+    return this.mode === 'ephemeral' ? this.ephemeralUnlocked : this.key !== null
   }
 
   /** Instance delegate for the module-level environment check. */
@@ -95,6 +106,7 @@ export class Vault {
 
   /** Derive a fresh PIN-based key and unlock the vault in memory. */
   async setupWithPin(pin: string): Promise<void> {
+    this.rejectEphemeral()
     // Re-running setup with an existing vault would store new records under
     // a fresh salt while old records keep theirs, bricking every unlock
     // path. Wipe or unlock the existing vault instead.
@@ -113,6 +125,7 @@ export class Vault {
 
   /** Unlock with the user PIN. Wrong PIN fails the AES-GCM auth tag. */
   async unlockWithPin(pin: string): Promise<void> {
+    this.rejectEphemeral()
     const records = await this.getAllRecords()
     if (records.length === 0) throw new VaultLockedError('vault is not set up')
     // Records can carry different salts (e.g. a partially-overwritten vault),
@@ -139,6 +152,7 @@ export class Vault {
 
   /** Unlock via WebAuthn PRF extension (Option B). */
   async unlockWithPrf(): Promise<void> {
+    this.rejectEphemeral()
     if (!isPrfSupported()) {
       throw new VaultPrfError('WebAuthn PRF is not supported in this environment')
     }
@@ -149,25 +163,7 @@ export class Vault {
       throw new VaultPrfError('vault has no PRF-protected records')
     }
     const salt: ArrayBuffer = rec ? rec.salt : (randomBytes(16).buffer as ArrayBuffer)
-    const publicKey: PublicKeyCredentialRequestOptions = {
-      challenge: randomBytes(32),
-      userVerification: 'required',
-      extensions: { prf: { eval: { first: salt } } } as PublicKeyCredentialRequestOptions['extensions'],
-    }
-    if (rec?.credentialId) {
-      publicKey.allowCredentials = [{ id: rec.credentialId, type: 'public-key' }]
-    }
-    let assertion: PublicKeyCredential | null = null
-    try {
-      assertion = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential
-    } catch (err) {
-      throw new VaultPrfError(`PRF assertion failed: ${(err as Error)?.message ?? String(err)}`)
-    }
-    const ext = (assertion as unknown as {
-      clientExtensionResults?: { prf?: { results?: { first?: ArrayBuffer } } }
-    })?.clientExtensionResults
-    const prfOutput = ext?.prf?.results?.first
-    if (!prfOutput) throw new VaultPrfError('PRF extension denied or unavailable')
+    const { prfOutput, rawId } = await this.requestPrf(salt, rec?.credentialId ?? null)
     const key = await this.derivePrfKey(prfOutput, salt)
     if (rec) {
       // Verifies the PRF output matches what encrypted the vault.
@@ -176,12 +172,78 @@ export class Vault {
     this.key = key
     this.keyMethod = 2
     this.activeSalt = salt
-    this.prfCredentialId = (assertion?.rawId as ArrayBuffer) ?? rec?.credentialId ?? null
+    this.prfCredentialId = rawId ?? rec?.credentialId ?? null
     this.touch()
+  }
+
+  /**
+   * Migrate ephemeral secrets to a PIN-protected persistent vault in place:
+   * derives the PIN key, re-encrypts every in-memory secret into IndexedDB
+   * and switches this vault's mode to 'persistent'.
+   */
+  async persistToPin(pin: string): Promise<void> {
+    this.requireEphemeralMode('persistToPin')
+    const existing = await this.getAllRecords()
+    if (existing.length > 0) {
+      throw new VaultError('vault already set up; unlock or wipe it first', 'VAULT_ALREADY_SET_UP')
+    }
+    const salt = randomBytes(16).buffer as ArrayBuffer
+    const key = await this.derivePinKey(pin, salt)
+    this.key = key
+    this.keyMethod = 1
+    this.activeSalt = salt
+    this.prfCredentialId = null
+    await this.migrateEphemeralSecrets()
+    this.touch()
+  }
+
+  /**
+   * Migrate ephemeral secrets to a PRF-protected persistent vault in place,
+   * bootstrapping a fresh WebAuthn PRF salt (may prompt biometrics once).
+   */
+  async persistToPrf(): Promise<void> {
+    this.requireEphemeralMode('persistToPrf')
+    if (!isPrfSupported()) {
+      throw new VaultPrfError('WebAuthn PRF is not supported in this environment')
+    }
+    const existing = await this.getAllRecords()
+    if (existing.length > 0) {
+      throw new VaultError('vault already set up; unlock or wipe it first', 'VAULT_ALREADY_SET_UP')
+    }
+    const salt = randomBytes(16).buffer as ArrayBuffer
+    const { prfOutput, rawId } = await this.requestPrf(salt, null)
+    const key = await this.derivePrfKey(prfOutput, salt)
+    this.key = key
+    this.keyMethod = 2
+    this.activeSalt = salt
+    this.prfCredentialId = rawId
+    await this.migrateEphemeralSecrets()
+    this.touch()
+  }
+
+  /** True when any secret exists in memory (ephemeral) or IndexedDB (persistent). */
+  async hasSecrets(): Promise<boolean> {
+    if (this.mode === 'ephemeral') {
+      return this.ephemeralSecrets.size > 0
+    }
+    const records = await this.getAllRecords()
+    return records.length > 0
   }
 
   /** Re-encrypt and upsert a secret. Requires an unlocked vault. */
   async putSecret(id: SecretId, value: string): Promise<void> {
+    if (this.mode === 'ephemeral') {
+      this.requireUnlocked()
+      this.ephemeralSecrets.set(id, value)
+      this.notifyChange()
+      this.touch()
+      return
+    }
+    await this.putPersistentSecret(id, value)
+  }
+
+  /** Encrypt and upsert one record into IndexedDB (persistent write path). */
+  private async putPersistentSecret(id: SecretId, value: string): Promise<void> {
     this.requireKey()
     const salt = this.activeSalt ?? (randomBytes(16).buffer as ArrayBuffer)
     const iv = randomBytes(12)
@@ -212,6 +274,15 @@ export class Vault {
 
   /** Decrypt one secret with the in-memory key; plaintext is never cached. */
   async getSecret(id: SecretId): Promise<string> {
+    if (this.mode === 'ephemeral') {
+      this.requireUnlocked()
+      const value = this.ephemeralSecrets.get(id)
+      if (value === undefined) {
+        throw new VaultError(`secret '${id}' not found`, 'VAULT_NOT_FOUND')
+      }
+      this.touch()
+      return value
+    }
     this.requireKey()
     const rec = (await this.withStore('readonly', (store) => store.get(id))) as VaultRecord | undefined
     if (!rec) throw new VaultError(`secret '${id}' not found`, 'VAULT_NOT_FOUND')
@@ -226,9 +297,12 @@ export class Vault {
       clearTimeout(this.timer)
       this.timer = null
     }
-    const wasUnlocked = this.key !== null
+    const wasUnlocked = this.isUnlocked()
     this.key = null
     this.activeSalt = null
+    // Ephemeral secrets die with the session lock — there is no disk copy.
+    this.ephemeralSecrets.clear()
+    this.ephemeralUnlocked = false
     if (wasUnlocked) {
       for (const cb of [...this.lockSubs]) {
         try {
@@ -242,6 +316,13 @@ export class Vault {
 
   /** Delete every record from the IndexedDB vault store and lock. */
   async wipeAll(): Promise<void> {
+    if (this.mode === 'ephemeral') {
+      // Ephemeral wipe clears the in-memory Map only: there is no disk to
+      // wipe, and the session vault stays usable (no re-unlock path exists).
+      this.ephemeralSecrets.clear()
+      this.notifyChange()
+      return
+    }
     await this.withStore('readwrite', (store) => {
       store.clear()
       return undefined
@@ -289,6 +370,94 @@ export class Vault {
   private requireKey(): CryptoKey {
     if (!this.key) throw new VaultLockedError()
     return this.key
+  }
+
+  /** Gate for ephemeral-mode secret access (no key material exists there). */
+  private requireUnlocked(): void {
+    if (!this.isUnlocked()) throw new VaultLockedError()
+  }
+
+  /** Persistent-only entry points are unusable on an ephemeral vault. */
+  private rejectEphemeral(): void {
+    if (this.mode === 'ephemeral') {
+      throw new VaultError('vault is ephemeral', 'VAULT_EPHEMERAL')
+    }
+  }
+
+  /** Migration entry points only make sense on an ephemeral vault. */
+  private requireEphemeralMode(method: string): void {
+    if (this.mode !== 'ephemeral') {
+      throw new VaultError(`${method} requires an ephemeral vault`, 'VAULT_NOT_EPHEMERAL')
+    }
+  }
+
+  /**
+   * Run one WebAuthn PRF assertion against the given salt, optionally
+   * scoped to a stored credential. Converts every failure mode into a
+   * typed VaultPrfError.
+   */
+  private async requestPrf(
+    salt: ArrayBuffer,
+    credentialId: ArrayBuffer | null,
+  ): Promise<{ prfOutput: ArrayBuffer; rawId: ArrayBuffer | null }> {
+    const publicKey: PublicKeyCredentialRequestOptions = {
+      challenge: randomBytes(32),
+      userVerification: 'required',
+      extensions: { prf: { eval: { first: salt } } } as PublicKeyCredentialRequestOptions['extensions'],
+    }
+    if (credentialId) {
+      publicKey.allowCredentials = [{ id: credentialId, type: 'public-key' }]
+    }
+    let assertion: PublicKeyCredential | null = null
+    try {
+      assertion = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential
+    } catch (err) {
+      throw new VaultPrfError(`PRF assertion failed: ${(err as Error)?.message ?? String(err)}`)
+    }
+    const ext = (assertion as unknown as {
+      clientExtensionResults?: { prf?: { results?: { first?: ArrayBuffer } } }
+    })?.clientExtensionResults
+    const prfOutput = ext?.prf?.results?.first
+    if (!prfOutput) throw new VaultPrfError('PRF extension denied or unavailable')
+    return { prfOutput, rawId: (assertion?.rawId as ArrayBuffer) ?? null }
+  }
+
+  /**
+   * Re-encrypt every ephemeral secret into IndexedDB, then switch to
+   * persistent mode in place. Records are written while the vault is still
+   * ephemeral: a mid-migration IndexedDB failure (quota exceeded,
+   * private-mode write rejection) must leave the not-yet-migrated secrets
+   * reachable in the ephemeral Map with the mode intact, so 'Remember' can
+   * simply be retried. The mode flip and the Map drop happen only after
+   * every record landed on disk.
+   */
+  private async migrateEphemeralSecrets(): Promise<void> {
+    const entries = [...this.ephemeralSecrets]
+    try {
+      for (const [id, value] of entries) {
+        await this.putPersistentSecret(id, value)
+      }
+    } catch (err) {
+      // Roll back: stay ephemeral, drop the derived key, and best-effort
+      // remove any records that already landed — otherwise the retry's
+      // empty-vault check trips over the half-written set.
+      try {
+        await this.withStore('readwrite', (store) => {
+          store.clear()
+          return undefined
+        })
+      } catch {
+        /* the ephemeral Map is still intact; nothing more to do here */
+      }
+      this.key = null
+      this.activeSalt = null
+      this.prfCredentialId = null
+      throw err
+    }
+    this.mode = 'persistent'
+    this.ephemeralUnlocked = false
+    this.ephemeralSecrets.clear()
+    this.notifyChange()
   }
 
   private async derivePinKey(pin: string, salt: ArrayBuffer): Promise<CryptoKey> {
@@ -358,7 +527,7 @@ export class Vault {
       clearTimeout(this.timer)
       this.timer = null
     }
-    if (this.idleTimeoutMs > 0 && this.key) {
+    if (this.idleTimeoutMs > 0 && this.isUnlocked()) {
       this.timer = setTimeout(() => {
         this.timer = null
         this.lock()
@@ -369,7 +538,7 @@ export class Vault {
   private openDb(): Promise<IDBDatabase> {
     if (!this.dbPromise) {
       this.dbPromise = new Promise((resolve, reject) => {
-        const req = indexedDB.open(this.dbName, DB_VERSION)
+        const req = (this.idbFactory ?? indexedDB).open(this.dbName, DB_VERSION)
         req.onupgradeneeded = () => {
           const db = req.result
           if (!db.objectStoreNames.contains(STORE_NAME)) {

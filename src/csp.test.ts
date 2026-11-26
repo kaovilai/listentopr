@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   connectSrcValue,
+  cspBypassViaProxy,
   endpointAllowedByConnectSrc,
+  endpointUsable,
   styleSrcAllowsInline,
   styleSrcValue,
 } from './csp'
@@ -84,5 +86,125 @@ describe('endpointAllowedByConnectSrc', () => {
 
   it('host matching is case-insensitive', () => {
     expect(endpointAllowedByConnectSrc('https://API.Example.Com/v1', SHIPPED_CONNECT_SRC, selfOrigin)).toBe(true)
+  })
+})
+
+describe('endpointUsable', () => {
+  const selfOrigin = 'https://listentopr.example'
+
+  it('true when connect-src allows the endpoint and the proxy is inactive', () => {
+    expect(
+      endpointUsable('https://api.example.com/v1', {
+        connectSrc: SHIPPED_CONNECT_SRC,
+        selfOrigin,
+        proxyActive: false,
+      }),
+    ).toBe(true)
+  })
+
+  it('false when connect-src blocks the endpoint and the proxy is inactive', () => {
+    expect(
+      endpointUsable('https://api.openai.com/v1', {
+        connectSrc: SHIPPED_CONNECT_SRC,
+        selfOrigin,
+        proxyActive: false,
+      }),
+    ).toBe(false)
+    // Omitted proxyActive behaves like inactive.
+    expect(
+      endpointUsable('https://api.openai.com/v1', {
+        connectSrc: SHIPPED_CONNECT_SRC,
+        selfOrigin,
+      }),
+    ).toBe(false)
+  })
+
+  it('true when the proxy is active even though connect-src blocks the endpoint', () => {
+    expect(
+      endpointUsable('https://api.openai.com/v1', {
+        connectSrc: SHIPPED_CONNECT_SRC,
+        selfOrigin,
+        proxyActive: true,
+      }),
+    ).toBe(true)
+  })
+
+  it('true when connect-src allows and the proxy is also active', () => {
+    expect(
+      endpointUsable('https://api.example.com/v1', {
+        connectSrc: SHIPPED_CONNECT_SRC,
+        selfOrigin,
+        proxyActive: true,
+      }),
+    ).toBe(true)
+  })
+
+  it('false when the proxy is active but the endpoint is not https', () => {
+    // The SW proxy only forwards https targets; without this check the
+    // endpoint saves fine and every LLM call dies on the SW's opaque 502.
+    expect(
+      endpointUsable('http://api.example.com/v1', {
+        connectSrc: SHIPPED_CONNECT_SRC,
+        selfOrigin,
+        proxyActive: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('false when the proxy is active but the endpoint is the app\'s own origin', () => {
+    expect(
+      endpointUsable(`${selfOrigin}/llm`, {
+        connectSrc: SHIPPED_CONNECT_SRC,
+        selfOrigin,
+        proxyActive: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('false when the proxy is active and the endpoint is an unparseable URL', () => {
+    expect(
+      endpointUsable('not a url', {
+        connectSrc: SHIPPED_CONNECT_SRC,
+        selfOrigin,
+        proxyActive: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('empty endpoints are always usable', () => {
+    expect(endpointUsable('', { connectSrc: SHIPPED_CONNECT_SRC, selfOrigin })).toBe(true)
+    expect(endpointUsable('   ', { connectSrc: SHIPPED_CONNECT_SRC, selfOrigin })).toBe(true)
+    expect(endpointUsable('', { connectSrc: SHIPPED_CONNECT_SRC, selfOrigin, proxyActive: false })).toBe(true)
+  })
+
+  it('a missing or empty connect-src blocks nothing directly', () => {
+    expect(
+      endpointUsable('https://anywhere.example/v1', { connectSrc: null, selfOrigin }),
+    ).toBe(true)
+    expect(
+      endpointUsable('https://anywhere.example/v1', { connectSrc: '', selfOrigin }),
+    ).toBe(true)
+  })
+
+  it('matches the old direct-call verdict for the same inputs', () => {
+    for (const endpoint of [
+      'https://api.example.com',
+      'https://api.example.com/v1',
+      'https://listentopr.example/api',
+      'https://api.github.com',
+      'https://api.openai.com/v1',
+      'https://api.example.com.evil.io',
+      'ftp://api.example.com',
+    ]) {
+      expect(
+        endpointUsable(endpoint, { connectSrc: SHIPPED_CONNECT_SRC, selfOrigin, proxyActive: false }),
+      ).toBe(endpointAllowedByConnectSrc(endpoint, SHIPPED_CONNECT_SRC, selfOrigin))
+    }
+  })
+})
+
+describe('cspBypassViaProxy', () => {
+  it('false without a controlling service worker (no SW in node)', () => {
+    expect(cspBypassViaProxy()).toBe(false)
   })
 })

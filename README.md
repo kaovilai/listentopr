@@ -9,12 +9,29 @@ control, and a screen wake lock so long reviews keep playing.
 Everything runs client-side. GitHub tokens and LLM API keys never leave the
 device unencrypted, and no plaintext secret is ever persisted.
 
+**No signup, no gate.** The first run drops you straight into the main view with
+an ephemeral session vault: keys you save live only for the session
+("Saved for this session"). When you want them back next launch, Settings has a
+**Remember for next time** button (biometric via WebAuthn PRF when supported,
+else a PIN). A **Try a sample** button plays a bundled demo transcript — no
+network, no keys, instant TTS.
+
 ## What it does
 
-1. **Ingest** — fetch PR metadata, files, reviews and comments from the GitHub
-   REST API (`src/github.ts`). Generated files (lockfiles, builds, dist output)
-   are filtered out; image URLs and mermaid blocks are extracted from the PR
-   body and comments; images are fetched as data URLs (best effort).
+1. **Ingest** — the input box routes through `parseGitTarget`
+   (`src/github.ts`): PR URLs/shorthand take the classic PR path; blob/raw
+   file URLs, commit URLs and compare URLs load as pseudo-PRs
+   (`fetchFileContent` / `fetchCommit` / `fetchCompare`); anything multiline
+   or long that is not a URL is offered to the paste parser
+   (`src/paste.ts` `parsePastedContent` — a pasted PR description plus diff
+   becomes listenable content, cached by a deterministic content hash);
+   anything else is a clear error. GitHub works unauthenticated throughout —
+   an empty token simply means public-data-only. Generated files (lockfiles,
+   builds, dist output) are filtered out of every source; when a PR reports
+   more changed files than survived filtering, the status line says so
+   ("Showing N of M changed files (lockfiles/generated skipped)"). Image URLs
+   and mermaid blocks are extracted from the PR body and comments; images are
+   fetched as data URLs (best effort).
 2. **Transcribe** — send the sanitized PR content to an LLM
    (`src/llm.ts`, `src/transcript.ts`) and speak the structured result.
    The transcript is generated as a **stream** (`createTranscriptStream`):
@@ -22,27 +39,41 @@ device unencrypted, and no plaintext secret is ever persisted.
    images or mermaid diagrams; images are attached to that call only), Key
    Changes batches (up to 10 small files per batch, oversized patches get a
    batch of their own), and review notes (only when feedback exists). Each
-   call returns strict JSON `{title, sentences, summary}` and carries only
-   short rolling summaries of earlier sections, so context stays flat no
+   call returns strict JSON `{title, sentences, summary, files}` and carries
+   only short rolling summaries of earlier sections, so context stays flat no
    matter how large the PR is. Diff text is sanitized for speech: markdown,
    hunk markers, SHAs and symbol chains are collapsed into speakable prose.
+   Sections narrate at the configured detail level (brief by default;
+   Settings → "Detailed change narration" makes the model state per-file
+   additions/removals). Every LLM call is wrapped in a retry engine
+   (`src/retry.ts`): retryable HTTP statuses (timeouts, rate limits, 5xx)
+   back off with exponential full jitter — the status shows "Retrying in
+   Xs…" — and a final failure surfaces an actionable message ("LLM provider
+   rejected the API key — re-check it in Settings", etc.) instead of a raw
+   error.
 3. **Speak** — play the transcript with `speechSynthesis`
-   (`src/tts.ts`): play/pause/resume/stop, skip sentence or section, rate
-   0.8x–2.0x, voice selection (persisted), clickable sentences with active
-   highlight and auto-scroll (`src/app.ts`). Playback starts as soon as the
-   first section arrives (`tts.load` + `play`); later sections are appended
-   on arrival (`tts.appendSections`) and chain seamlessly into speech. The
-   app prefetches the next section when speech enters the last few
-   sentences of the ready content, and if speech does reach the end first
-   it shows a "Generating next section…" hold instead of flipping to the
-   stopped state, then resumes automatically. Starting a new load or
-   pressing Stop aborts the in-flight stream.
+   (`src/tts.ts`): play/pause/resume/stop, skip sentence or section, replay
+   the current sentence, rate 0.8x–2.0x, voice selection (persisted),
+   clickable sentences with active highlight and auto-scroll (`src/app.ts`).
+   Playback starts as soon as the first section arrives (`tts.load` +
+   `play`); later sections are appended on arrival (`tts.appendSections`)
+   and chain seamlessly into speech. The app prefetches the next section
+   when speech enters the last few sentences of the ready content, and if
+   speech does reach the end first it shows a "Generating next section…"
+   hold instead of flipping to the stopped state, then resumes
+   automatically. Starting a new load or pressing Stop aborts the
+   in-flight stream.
 4. **Stay awake** — a Screen Wake Lock is held while playing and released when
    stopped, with a dismissible fallback banner where the API is unavailable
    (`src/wakelock.ts`).
 5. **Work offline** — a service worker precaches the app shell
    (`public/sw.js`, `public/manifest.webmanifest`); the app is installable and
-   accepts PR URLs via the Web Share Target API.
+   accepts PR URLs via the Web Share Target API. The service worker also runs
+   an **LLM proxy** (`src/llmproxy.ts`): once it controls the page, LLM calls
+   to custom endpoints are rewritten as same-origin proxy requests the page
+   CSP cannot block, so a custom endpoint works even when `connect-src`
+   would have rejected it (the status notes it once:
+   "routed via service worker").
 
 ## Development
 
@@ -67,6 +98,13 @@ Node 20+ recommended.
   run through HKDF-SHA256. Derived keys are non-extractable and live only in
   memory; `lock()` drops them and an idle auto-lock (default 15 minutes,
   configurable, 0 disables) re-locks the vault.
+- **Ephemeral-first**: the vault starts in `mode: 'ephemeral'` — an in-memory
+  Map, no PIN gate, no IndexedDB touch. Secrets live only until the tab closes
+  (or the session locks). **Remember for next time** migrates in place:
+  `persistToPrf()` (one biometric prompt) or `persistToPin()` derives a key,
+  re-encrypts every session secret into IndexedDB and flips the vault to
+  persistent mode. Next launch, saved records are detected and the unlock
+  screen shows (biometric button first when supported).
 - **Zero plaintext persistence**: only `{ciphertext, iv, salt, method}` records
   are stored, in IndexedDB. Nothing readable at rest, no secret in logs.
 - **CSP**: `index.html` ships a strict Content-Security-Policy
@@ -76,7 +114,10 @@ Node 20+ recommended.
   be allowed for diagrams to display. This exception is styles only —
   `script-src` stays `'self'` with no inline-script allowance.
   `connect-src` allows only `self`, the GitHub API hosts, and the configured
-  LLM endpoint.
+  LLM endpoint — but a custom endpoint the CSP would block still works once
+  the service-worker proxy controls the page (see `src/llmproxy.ts` and
+  `endpointUsable` in `src/csp.ts`); only when neither path can reach it does
+  Settings refuse to save it.
 - Token sanitization: errors thrown from GitHub fetching have the token
   replaced with `[REDACTED]` (`src/github.ts`); LLM errors redact the API key
   (`src/llm.ts`). `referrer` is `no-referrer`.
@@ -118,6 +159,7 @@ batching (10 files per call):
 | Context window (tokens) | `128000` | The model's context window. Batches are sized from it: fat windows get fat batches, small windows shrink them. |
 | Max per call (tokens) | `200000` | Hard cap on input tokens per LLM call (effectively the smaller of this and the context window). |
 | Single-shot when it fits | off | When the whole PR (description, comments, reviews, every patch) fits the window, generate the entire transcript in one call instead of section-by-section batches. The status line notes "Generating in a single pass." when it fires. |
+| Detailed change narration | off (`brief`) | Brief narrates changes by intent and logic flow. Detailed makes the model state per-file removals and additions as separate sentences, using the per-file +N/-M counts. Persisted as `listentopr.detail`. |
 
 **Why 200k per call instead of the full window?** Prompts that fill the
 entire window are slower to start generating — the first section, and with it
@@ -144,13 +186,40 @@ playing automatically. Routing lives in `src/app.ts`.
 
 ## Convenience features
 
-- **Input shorthand** — the Listen box accepts full PR URLs, scheme-less
-  `github.com/owner/repo/pull/123`, and `owner/repo#123`. Unparseable input
-  shows a clear error instead of failing silently.
+- **Input routing** — the Listen box accepts full PR URLs, scheme-less
+  `github.com/owner/repo/pull/123`, and `owner/repo#123` (the classic PR
+  path); blob/raw/commit/compare URLs (pseudo-PR loads); and pasted PR text
+  (description plus diff — no GitHub access needed at all). Multiline or long
+  non-URL input goes to the paste parser; short garbage shows a clear error
+  instead of failing silently.
+- **Demo mode** — **Try a sample** (next to the Listen box) loads a bundled
+  four-section demo transcript with a mermaid diagram, no network and no
+  keys, and starts speaking instantly. The status line reads
+  "Demo transcript".
+- **Bookmarklet** — the **Click to listen** chip in the main view (see
+  [Bookmarklet](#bookmarklet)).
+- **LLM retries** — retryable failures (timeout, rate limit, 5xx, network)
+  back off with exponential full jitter ("Retrying in Xs…"); final failures
+  show an actionable message (bad key, unknown model, provider error).
+  A recovered connection says "Connection recovered — continuing."
+- **Replay sentence** — a ↻ control restarts the current sentence while
+  playing (or paused).
+- **Voice preview** — Settings → Voice preview lists every system voice with
+  a Play button that speaks "This is how I sound." at the current rate and
+  pitch.
+- **Background warning** — hiding the tab while playing shows a banner:
+  "Playback pauses when this tab is hidden — keep it open" (browsers suspend
+  speech synthesis in background tabs; the banner clears on return).
+- **Big-PR honesty** — when a PR's raw changed-file count exceeds the kept
+  count, the status says "Showing N of M changed files (lockfiles/generated
+  skipped)".
+- **File chips** — each transcript section shows the files it narrates as
+  chips: real PRs link to the PR's Files tab, file-target loads link to the
+  GitHub blob, pasted content shows plain (non-link) chips.
 - **Transcript cache** — fully generated transcripts are stored locally in
   IndexedDB (non-secret data; keys stay in the encrypted vault) keyed by PR
-  head SHA. Re-listening to an unchanged PR loads instantly
-  ("Loaded from cache") with no LLM call.
+  head SHA — or by the content hash for pasted text. Re-listening to
+  unchanged content loads instantly ("Loaded from cache") with no LLM call.
 - **What's New delta** — when the PR head has moved since your last cached
   listen, the app fetches the commits pushed since your last listen, builds a
   short "What's New" section from them (single LLM call, previous summary as
@@ -209,6 +278,35 @@ not just iOS — the app parses and auto-loads it on launch. Note that
 share-sheet delivery of the URL requires the PWA to be installed to the home
 screen.
 
+## Bookmarklet
+
+The main view ships a **Click to listen** chip. Drag it to your browser's
+bookmarks bar; then, on any GitHub pull request page, clicking the bookmark
+hops straight into ListenToPR with that PR loaded and playing. (Clicking the
+chip on the page itself may be blocked by the strict CSP — the drag-to-
+bookmarks-bar use is the point; bookmarklets run outside page CSP.)
+
+To create it manually, use this URL as a new bookmark:
+
+```text
+javascript:location.href='https://github.tig.pw/listentopr/?pr='+encodeURIComponent(location.href)
+```
+
+## On-ramp: no account, no keys, no GitHub access
+
+The fastest path from zero to listening:
+
+1. Open the app — no vault setup, no PIN. The main view is right there.
+2. Press **Try a sample** — a bundled demo transcript (with a mermaid
+   diagram) starts speaking immediately. No network, no keys.
+3. Have a PR link? Paste it in the box. Unauthenticated GitHub works for
+   public PRs, files, commits and compares — add a token in Settings only
+   for private repos or rate limits.
+4. No link? Paste the PR text itself (description plus diff). It parses,
+   narrates and caches like a real PR.
+5. Only when you want keys remembered across launches does the vault enter
+   the picture: **Remember for next time** (biometric or PIN).
+
 ## Diagrams
 
 When a PR contains mermaid code blocks (`src/github.ts`
@@ -251,6 +349,12 @@ modes (`light` → Light, anything unknown → Auto).
 | Image URL extraction + data-URL fetch (token only to GitHub hosts) | `src/github.ts` (`extractImageUrls`, `fetchImageAsDataUrl`) |
 | Mermaid block extraction | `src/github.ts` (`extractMermaidBlocks`) |
 | PR URL parsing (case-insensitive host, /files, query, fragment) | `src/github.ts` (`parsePrUrl`, `findPrUrl`) |
+| Extended targets: blob/raw file, commit, compare URLs | `src/github.ts` (`parseGitTarget`, `fetchFileContent`, `fetchCommit`, `fetchCompare`) |
+| Pasted PR text ingestion (diff blocks, content-hash cache key) | `src/paste.ts` (`parsePastedContent`, `contentHash`) |
+| Input routing (url vs paste vs garbage) | `src/app.ts` (`routeInput`) |
+| LLM retry (exponential full jitter, retryable statuses, actionable errors) | `src/retry.ts` (`withRetry`, `retryableHttpError`, `actionableLlmError`) |
+| Service-worker LLM proxy for CSP-blocked custom endpoints | `src/llmproxy.ts` (`llmProxyFetch`, `isProxyActive`), `src/csp.ts` (`endpointUsable`), `public/sw.js` |
+| Ephemeral vault mode + persist-to-PIN/PRF migration | `src/vault.ts` (`mode`, `persistToPin`, `persistToPrf`, `hasSecrets`) |
 | Token redaction in errors | `src/github.ts` (`sanitizeError`), `src/llm.ts` (key redaction) |
 | Multi-provider chat client (OpenAI/Anthropic/Gemini), timeout, abort, key redaction | `src/llm.ts` (`chat`, `PROVIDER_DEFAULT_ENDPOINTS`, 120s default) |
 | Speech-safe sanitization (markdown, hunks, SHAs, URLs, symbols) | `src/transcript.ts` (`sanitizeLine`) |
@@ -270,6 +374,7 @@ modes (`light` → Light, anything unknown → Auto).
 | PWA manifest + icons | `public/manifest.webmanifest`, `public/icon.svg` |
 | Service worker (precache, cache-first + revalidate, old-cache cleanup) | `public/sw.js` |
 | Share target (manifest + query routing) | `public/manifest.webmanifest`, `src/app.ts` |
-| App shell: PIN setup, locked view, settings, transcript UI, controls | `src/app.ts`, `src/styles.css`, `index.html` |
+| App shell: first-run no-gate, locked view, settings, transcript UI, controls | `src/app.ts`, `src/styles.css`, `index.html` |
+| Demo transcript, bookmarklet chip, replay, voice preview, file chips, detail toggle, background warning | `src/app.ts`, `src/styles.css` |
 | CSP with build-time LLM endpoint injection | `index.html`, `vite.config.ts` |
-| Tests (vault 22, github 24, transcript 29, tts 27, wakelock 11) | `src/*.test.ts` |
+| Tests (544 across 19 files) | `src/*.test.ts` |

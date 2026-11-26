@@ -8,6 +8,7 @@ import type {
   PullRequestData,
   Transcript,
   TranscriptBudget,
+  TranscriptDetail,
   TranscriptSection,
   TranscriptStream,
 } from './types'
@@ -17,6 +18,8 @@ export interface BuildTranscriptOptions {
   imageDataUrls?: string[]
   /** Context-window budget for prompt sizing/truncation. */
   budget?: TranscriptBudget
+  /** Section verbosity. Default 'brief'. */
+  detail?: TranscriptDetail
 }
 
 // ---------------------------------------------------------------------------
@@ -274,18 +277,69 @@ export function splitSentences(text: string): string[] {
 // Transcript build
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = [
+/** Max filenames kept on a parsed section (schema cap). */
+const MAX_SECTION_FILES = 8
+
+/** Shared schema description for the section files field. */
+const FILES_SCHEMA_LINE =
+  'files: string[] of filenames this section discusses, at most 8, copied verbatim from the input; use [] when none.'
+
+/** Changes-section instruction, branched on detail. */
+const CHANGES_INSTRUCTION: Record<TranscriptDetail, string> = {
+  brief: 'changes: walk through the code changes by intent and logic flow; never quote code verbatim.',
+  detailed:
+    'changes: state removals and additions as separate statements, using the per-file +N/-M counts provided; never quote code verbatim.',
+}
+
+const SYSTEM_PROMPT_BASE = [
   'You are a senior software engineer explaining a pull request aloud to a colleague who is listening, not reading.',
   'Respond with STRICT JSON only: no markdown fences, no prose outside the JSON.',
-  'JSON shape: {"title": string, "sections": [{"id": string, "title": string, "sentences": string[]}]}.',
+  'JSON shape: {"title": string, "sections": [{"id": string, "title": string, "sentences": string[], "files": string[]}]}.',
   'Use these section ids, in this exact order: "overview", "architecture", "changes", "review-notes".',
   'overview: what this pull request does and why, in plain language.',
   'architecture: how the change fits the system; describe every mermaid diagram and attached image in plain English, covering what the nodes or components are and how they connect.',
-  'changes: walk through the code changes by intent and logic flow; never quote code verbatim.',
+]
+
+const SYSTEM_PROMPT_TAIL = [
   'review-notes: weave the reviewer comments and review feedback into a coherent narrative.',
   'Omit the review-notes section entirely when there is no review feedback.',
+  FILES_SCHEMA_LINE,
   'Every sentence must be self-contained and natural when read aloud by text-to-speech.',
-].join('\n')
+]
+
+/** Full-transcript system prompt (buildTranscript + single-shot stream mode). */
+function fullSystemPrompt(detail: TranscriptDetail): string {
+  return [...SYSTEM_PROMPT_BASE, CHANGES_INSTRUCTION[detail], ...SYSTEM_PROMPT_TAIL].join('\n')
+}
+
+/**
+ * Validate + filter a parsed section's files: keep only string entries that
+ * appear verbatim in that call's input text (post-validation filter, so a
+ * model inventing filenames yields nothing), deduped and capped at
+ * MAX_SECTION_FILES. Returns undefined when nothing survives.
+ */
+function filterSectionFiles(files: unknown, inputText: string): string[] | undefined {
+  if (!Array.isArray(files)) return undefined
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const f of files) {
+    if (typeof f !== 'string' || f.length === 0 || seen.has(f)) continue
+    if (!inputText.includes(f)) continue
+    seen.add(f)
+    out.push(f)
+    if (out.length >= MAX_SECTION_FILES) break
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/** Per-file additions/deletions block appended to change prompts in detailed mode. */
+function perFileCountsBlock(files: PrFile[]): string[] {
+  return [
+    '',
+    '## Per-file additions/deletions (state removals and additions using these counts)',
+    ...files.map((f) => `- ${f.filename}: +${f.additions} additions, -${f.deletions} deletions`),
+  ]
+}
 
 const SECTION_ORDER = ['overview', 'architecture', 'changes', 'review-notes']
 
@@ -297,7 +351,9 @@ function buildUserPrompt(
   pr: PullRequestData,
   imageCount: number,
   maxFiles = 40,
+  detail: TranscriptDetail = 'brief',
 ): string {
+  const files = pr.files.slice(0, maxFiles)
   const lines: string[] = []
   lines.push(`Pull request: ${pr.ref.owner}/${pr.ref.repo}#${pr.ref.number}`)
   lines.push(`Title: ${pr.title}`)
@@ -307,9 +363,12 @@ function buildUserPrompt(
   )
   lines.push('', '## Description', truncate(pr.body || '(no description)', 6000))
   lines.push('', '## Changed files')
-  for (const f of pr.files.slice(0, maxFiles)) {
+  for (const f of files) {
     lines.push(`- ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})`)
     if (f.patch) lines.push(truncate(f.patch, 1200))
+  }
+  if (detail === 'detailed' && files.length > 0) {
+    lines.push(...perFileCountsBlock(files))
   }
   if (pr.mermaidBlocks.length > 0) {
     lines.push(
@@ -355,7 +414,7 @@ function extractJsonObject(raw: string): unknown {
 
 interface RawTranscript {
   title: string
-  sections: Array<{ id: string; title: string; sentences: string[] }>
+  sections: Array<{ id: string; title: string; sentences: string[]; files?: unknown }>
 }
 
 function isValidTranscriptShape(v: unknown): v is RawTranscript {
@@ -386,7 +445,7 @@ function orderSections(sections: TranscriptSection[]): TranscriptSection[] {
   })
 }
 
-function materializeTranscript(raw: string, pr: PullRequestData): Transcript {
+function materializeTranscript(raw: string, pr: PullRequestData, inputText = ''): Transcript {
   const parsed = extractJsonObject(raw)
   if (isValidTranscriptShape(parsed)) {
     const sections = parsed.sections
@@ -396,7 +455,7 @@ function materializeTranscript(raw: string, pr: PullRequestData): Transcript {
           .filter((sentence) => sentence.length > 0)
         const title = sanitizeLine(s.title)
         if (!title || sentences.length === 0) return null
-        return { id: s.id, title, sentences }
+        return { id: s.id, title, sentences, files: filterSectionFiles(s.files, inputText) }
       })
       .filter((s): s is TranscriptSection => s !== null)
     if (sections.length > 0) {
@@ -430,6 +489,8 @@ export async function buildTranscript(
   pr: PullRequestData,
   opts: BuildTranscriptOptions = {},
 ): Promise<Transcript> {
+  const detail = opts.detail ?? 'brief'
+  const systemText = fullSystemPrompt(detail)
   const imageDataUrls = opts.imageDataUrls ?? []
   const images: string[] = []
   for (let i = 0; i < pr.imageUrls.length; i++) {
@@ -437,21 +498,21 @@ export async function buildTranscript(
     if (typeof dataUrl === 'string' && dataUrl.length > 0) images.push(dataUrl)
   }
   let attached = images
-  let userText = buildUserPrompt(pr, attached.length)
+  let userText = buildUserPrompt(pr, attached.length, 40, detail)
   if (opts.budget !== undefined) {
     // Image cost counts against the user-prompt budget: kept images shrink
     // the text budget; images that cannot fit are dropped and the prompt
     // says they could not be loaded.
-    const fit = fitImages(resolveBudget(opts.budget), SYSTEM_PROMPT, images)
+    const fit = fitImages(resolveBudget(opts.budget), systemText, images)
     attached = fit.images
-    userText = buildUserPrompt(pr, attached.length)
+    userText = buildUserPrompt(pr, attached.length, 40, detail)
     if (attached.length === 0 && pr.imageUrls.length > 0) {
       userText += `\n${pr.imageUrls.length} image(s) were referenced but could not be loaded.`
     }
     userText = clampPromptToTokens(userText, fit.textBudget)
   }
   const messages: LlmMessage[] = [
-    { role: 'system', text: SYSTEM_PROMPT },
+    { role: 'system', text: systemText },
     {
       role: 'user',
       text: userText,
@@ -459,7 +520,7 @@ export async function buildTranscript(
     },
   ]
   const raw = await chat(config, messages)
-  return materializeTranscript(raw, pr)
+  return materializeTranscript(raw, pr, userText)
 }
 
 // ---------------------------------------------------------------------------
@@ -471,18 +532,33 @@ export interface DeltaSectionOptions {
   chat?: typeof chat
   /** Context-window budget: clamps the delta prompt to the per-call budget. */
   budget?: TranscriptBudget
+  /** Section verbosity. Default 'brief'. */
+  detail?: TranscriptDetail
 }
 
-const DELTA_SYSTEM_PROMPT = [
+const DELTA_SYSTEM_PROMPT_BASE = [
   'You are a senior software engineer speaking aloud to a colleague who is listening, not reading.',
   'The listener already heard a summary of this pull request earlier; the previously heard summary is provided.',
   'They now want ONLY what changed since that summary, not a repeat of the whole pull request.',
   'Respond with STRICT JSON only: no markdown fences, no prose outside the JSON.',
-  'JSON shape: {"title": string, "sentences": string[]}.',
+  'JSON shape: {"title": string, "sentences": string[], "files": string[]}.',
   'title: a short heading for this update.',
-  'sentences: the spoken content; never quote code verbatim.',
-  'Every sentence must be self-contained and natural when read aloud by text-to-speech.',
-].join('\n')
+]
+
+const DELTA_SENTENCES_INSTRUCTION: Record<TranscriptDetail, string> = {
+  brief: 'sentences: the spoken content; never quote code verbatim.',
+  detailed:
+    'sentences: the spoken content; state removals and additions as separate statements where the commits describe them; never quote code verbatim.',
+}
+
+function deltaSystemPrompt(detail: TranscriptDetail): string {
+  return [
+    ...DELTA_SYSTEM_PROMPT_BASE,
+    DELTA_SENTENCES_INSTRUCTION[detail],
+    FILES_SCHEMA_LINE,
+    'Every sentence must be self-contained and natural when read aloud by text-to-speech.',
+  ].join('\n')
+}
 
 function deltaUserPrompt(
   pr: PullRequestData,
@@ -517,15 +593,17 @@ export async function buildDeltaSection(
   opts: DeltaSectionOptions = {},
 ): Promise<TranscriptSection> {
   const chatFn = opts.chat ?? chat
+  const detail = opts.detail ?? 'brief'
+  const systemText = deltaSystemPrompt(detail)
   let userText = deltaUserPrompt(pr, newCommits, previousSummary)
   if (opts.budget !== undefined) {
     userText = clampPromptToTokens(
       userText,
-      userPromptBudget(resolveBudget(opts.budget), DELTA_SYSTEM_PROMPT),
+      userPromptBudget(resolveBudget(opts.budget), systemText),
     )
   }
   const messages: LlmMessage[] = [
-    { role: 'system', text: DELTA_SYSTEM_PROMPT },
+    { role: 'system', text: systemText },
     { role: 'user', text: userText },
   ]
   const raw = await chatFn(config, messages)
@@ -535,7 +613,12 @@ export async function buildDeltaSection(
       .flatMap((sentence) => splitSentences(sanitizeLine(sentence)))
       .filter((sentence) => sentence.length > 0)
     if (sentences.length > 0) {
-      return { id: 'whats-new', title: "What's New", sentences }
+      return {
+        id: 'whats-new',
+        title: "What's New",
+        sentences,
+        files: filterSectionFiles(parsed.files, userText),
+      }
     }
   }
   // Fallback: treat the raw reply as narrated text.
@@ -558,6 +641,8 @@ export interface TranscriptStreamOptions {
   chat?: typeof chat
   /** Context-window budget: batch sizing, overflow pre-checks, single-shot. */
   budget?: TranscriptBudget
+  /** Section verbosity. Default 'brief'. */
+  detail?: TranscriptDetail
 }
 
 /** TranscriptStream plus the next() cursor callers drive directly. */
@@ -636,31 +721,46 @@ function filesPerBatchFor(files: PrFile[], resolved: ResolvedBudget): number {
 const STREAM_SYSTEM_BASE = [
   'You are a senior software engineer explaining a pull request aloud to a colleague who is listening, not reading.',
   'Respond with STRICT JSON only: no markdown fences, no prose outside the JSON.',
-  'JSON shape: {"title": string, "sentences": string[], "summary": string}.',
+  'JSON shape: {"title": string, "sentences": string[], "summary": string, "files": string[]}.',
   'title: a short heading for this section.',
   'sentences: the spoken content of this section; never quote code verbatim.',
   'summary: a recap of this section in two to three sentences, used as context for later sections.',
+  FILES_SCHEMA_LINE,
   'Every sentence must be self-contained and natural when read aloud by text-to-speech.',
 ].join('\n')
 
 const STREAM_SECTION_INSTRUCTIONS: Record<
   Exclude<SectionSpec['kind'], 'single-shot'>,
-  string
+  Record<TranscriptDetail, string>
 > = {
-  overview:
-    'This section is the overview: what this pull request does and why, in plain language.',
-  architecture:
-    'This section covers architecture and diagrams: describe every mermaid diagram and attached image in plain English, covering what the nodes or components are and how they connect.',
-  changes:
-    'This section covers one batch of code changes: walk through these files by intent and logic flow.',
-  'review-notes':
-    'This section covers review feedback: weave the reviewer comments and reviews into a coherent narrative.',
+  overview: {
+    brief: 'This section is the overview: what this pull request does and why, in plain language.',
+    detailed: 'This section is the overview: what this pull request does and why, in plain language.',
+  },
+  architecture: {
+    brief:
+      'This section covers architecture and diagrams: describe every mermaid diagram and attached image in plain English, covering what the nodes or components are and how they connect.',
+    detailed:
+      'This section covers architecture and diagrams: describe every mermaid diagram and attached image in plain English, covering what the nodes or components are and how they connect.',
+  },
+  changes: {
+    brief:
+      'This section covers one batch of code changes: walk through these files by intent and logic flow.',
+    detailed:
+      'This section covers one batch of code changes: state removals and additions as separate statements, using the per-file +N/-M counts provided.',
+  },
+  'review-notes': {
+    brief:
+      'This section covers review feedback: weave the reviewer comments and reviews into a coherent narrative.',
+    detailed:
+      'This section covers review feedback: weave the reviewer comments and reviews into a coherent narrative.',
+  },
 }
 
 /** System prompt text for a section spec; single-shot reuses the full-transcript prompt. */
-function systemTextFor(spec: SectionSpec): string {
-  if (spec.kind === 'single-shot') return SYSTEM_PROMPT
-  return `${STREAM_SYSTEM_BASE}\n${STREAM_SECTION_INSTRUCTIONS[spec.kind]}`
+function systemTextFor(spec: SectionSpec, detail: TranscriptDetail = 'brief'): string {
+  if (spec.kind === 'single-shot') return fullSystemPrompt(detail)
+  return `${STREAM_SYSTEM_BASE}\n${STREAM_SECTION_INSTRUCTIONS[spec.kind][detail]}`
 }
 
 function systemTextForChanges(): string {
@@ -729,6 +829,7 @@ function changesUserPrompt(
   totalBatches: number,
   context: string,
   tokenBudget?: number,
+  detail: TranscriptDetail = 'brief',
 ): string {
   const lines: string[] = [
     prHeader(pr),
@@ -738,6 +839,9 @@ function changesUserPrompt(
   ]
   for (const f of files) {
     lines.push(`- ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})`)
+  }
+  if (detail === 'detailed' && files.length > 0) {
+    lines.push(...perFileCountsBlock(files))
   }
   if (tokenBudget === undefined) {
     for (const f of files) {
@@ -794,6 +898,7 @@ interface RawStreamSection {
   title: string
   sentences: string[]
   summary?: string
+  files?: unknown
 }
 
 function isValidStreamSection(v: unknown): v is RawStreamSection {
@@ -832,6 +937,7 @@ export function createTranscriptStream(
   opts: TranscriptStreamOptions = {},
 ): TranscriptStreamHandle {
   const chatFn = opts.chat ?? chat
+  const detail = opts.detail ?? 'brief'
   const imageDataUrls = opts.imageDataUrls ?? []
   const images: string[] = []
   for (let i = 0; i < pr.imageUrls.length; i++) {
@@ -846,10 +952,10 @@ export function createTranscriptStream(
   // overhead fits the window. Otherwise fall back to sectioned batches.
   function buildSingleShotMessages(): LlmMessage[] {
     return [
-      { role: 'system', text: SYSTEM_PROMPT },
+      { role: 'system', text: fullSystemPrompt(detail) },
       {
         role: 'user',
-        text: buildUserPrompt(pr, images.length, pr.files.length),
+        text: buildUserPrompt(pr, images.length, pr.files.length, detail),
         images: images.length > 0 ? images : undefined,
       },
     ]
@@ -945,7 +1051,7 @@ export function createTranscriptStream(
   function buildMessages(spec: SectionSpec): LlmMessage[] {
     if (spec.kind === 'single-shot') return singleShotMessages!
     const context = contextBlock(summaries)
-    const sys = systemTextFor(spec)
+    const sys = systemTextFor(spec, detail)
     // Images attach only to architecture calls, and (under a budget) only
     // when their estimated token cost fits the per-call room; otherwise they
     // are dropped and the prompt notes they could not be loaded.
@@ -966,7 +1072,7 @@ export function createTranscriptStream(
       case 'changes': {
         let { batch, total } = changesNumbering(spec)
         if (resolved === null) {
-          user = changesUserPrompt(pr, spec.files, batch, total, context)
+          user = changesUserPrompt(pr, spec.files, batch, total, context, undefined, detail)
         } else {
           // Overflow pre-check: while the batch's prompt exceeds the
           // per-call budget, binary-split the file list and queue the rest
@@ -974,7 +1080,7 @@ export function createTranscriptStream(
           // the token-budgeted prompt builder, which truncates its patch.
           const usable = userPromptBudget(resolved, sys)
           while (spec.files.length > 1) {
-            const probe = changesUserPrompt(pr, spec.files, batch, total, context)
+            const probe = changesUserPrompt(pr, spec.files, batch, total, context, undefined, detail)
             if (estimateTokens(probe) <= usable) break
             const mid = Math.floor(spec.files.length / 2)
             const rest = spec.files.slice(mid)
@@ -982,7 +1088,7 @@ export function createTranscriptStream(
             plan.splice(plan.indexOf(spec) + 1, 0, { kind: 'changes', files: rest })
             total = changesNumbering(spec).total
           }
-          user = changesUserPrompt(pr, spec.files, batch, total, context, usable)
+          user = changesUserPrompt(pr, spec.files, batch, total, context, usable, detail)
         }
         break
       }
@@ -1021,9 +1127,12 @@ export function createTranscriptStream(
   async function generateSection(spec: SectionSpec): Promise<Generated> {
     const { id, title } = sectionLabel(spec)
     let raw: string | null = null
+    let inputText = ''
     try {
+      const messages = buildMessages(spec)
+      inputText = messages[1]?.text ?? ''
       raw = await Promise.race([
-        chatFn(config, buildMessages(spec), { signal: controller.signal }),
+        chatFn(config, messages, { signal: controller.signal }),
         abortSignal,
       ])
     } catch {
@@ -1034,7 +1143,7 @@ export function createTranscriptStream(
       // One generation for the whole PR: materialize every section and
       // queue all but the first (overview stays first via orderSections).
       if (raw !== null) {
-        const transcript = materializeTranscript(raw, pr)
+        const transcript = materializeTranscript(raw, pr, inputText)
         if (transcript.sections.length > 0) {
           singleShotQueue.push(...transcript.sections.slice(1))
           return { section: transcript.sections[0]!, summary: '' }
@@ -1054,7 +1163,15 @@ export function createTranscriptStream(
             typeof parsed.summary === 'string' && parsed.summary.trim() !== ''
               ? truncate(parsed.summary.trim(), 400)
               : deriveSummary(sentences)
-          return { section: { id, title: cleanTitle, sentences }, summary }
+          return {
+            section: {
+              id,
+              title: cleanTitle,
+              sentences,
+              files: filterSectionFiles(parsed.files, inputText),
+            },
+            summary,
+          }
         }
       } else if (parsed === undefined) {
         // No JSON at all: narrate the raw reply, like buildTranscript.

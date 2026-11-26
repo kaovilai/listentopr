@@ -53,6 +53,47 @@ function freshVault(opts: { idleTimeoutMs?: number } = {}): Vault {
   return new Vault({ dbName: `vault-test-${dbCounter}-${crypto.randomUUID()}`, ...opts })
 }
 
+/**
+ * IDB factory whose first `failWrites` readwrite transactions throw
+ * synchronously (simulating quota exceeded / private-mode write rejection).
+ * Readonly transactions pass through untouched.
+ */
+function flakyWriteFactory(failWrites: number): IDBFactory {
+  let writes = 0
+  return new Proxy(indexedDB, {
+    get(target, prop, receiver) {
+      if (prop !== 'open') return Reflect.get(target, prop, receiver)
+      return (name: string, version?: number) => {
+        const req = (target as IDBFactory).open(name, version)
+        return new Proxy(req, {
+          get(t, p, r) {
+            if (p === 'result') {
+              const db = (t as IDBRequest<IDBDatabase>).result
+              return new Proxy(db, {
+                get(dbT, dbP, dbR) {
+                  if (dbP === 'transaction') {
+                    return (stores: string[], mode?: IDBTransactionMode) => {
+                      if (mode === 'readwrite') {
+                        writes += 1
+                        if (writes <= failWrites) {
+                          throw new Error('simulated quota exceeded')
+                        }
+                      }
+                      return (dbT as IDBDatabase).transaction(stores, mode)
+                    }
+                  }
+                  return Reflect.get(dbT, dbP, dbR)
+                },
+              })
+            }
+            return Reflect.get(t, p, r)
+          },
+        })
+      }
+    },
+  }) as unknown as IDBFactory
+}
+
 function installPrfMock(opts: {
   prfOutput?: Uint8Array
   credentialId?: Uint8Array
@@ -448,5 +489,316 @@ describe('Vault lock, auto-lock and subscriptions', () => {
     off()
     await vault.putSecret('github-token', 't2')
     expect(onChange).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------- ephemeral mode ----------
+
+/** IDB factory that fails on any touch: proves ephemeral mode never hits disk. */
+function throwingIdb(): IDBFactory {
+  const boom = (): never => {
+    throw new Error('IndexedDB must not be touched in ephemeral mode')
+  }
+  return { open: boom, deleteDatabase: boom, cmp: boom } as unknown as IDBFactory
+}
+
+function ephemeralVault(opts: { idleTimeoutMs?: number; dbName?: string } = {}): Vault {
+  dbCounter += 1
+  return new Vault({
+    dbName: opts.dbName ?? `vault-ephemeral-${dbCounter}-${crypto.randomUUID()}`,
+    mode: 'ephemeral',
+    idbFactory: throwingIdb(),
+    ...(opts.idleTimeoutMs !== undefined ? { idleTimeoutMs: opts.idleTimeoutMs } : {}),
+  })
+}
+
+describe('Vault ephemeral mode', () => {
+  it('is unlocked from construction and round-trips secrets with zero IDB (throwing deps)', async () => {
+    const vault = ephemeralVault()
+    expect(vault.isUnlocked()).toBe(true)
+    await vault.putSecret('github-token', 'ghp_session')
+    await vault.putSecret('llm-api-key', 'sk_session')
+    await expect(vault.getSecret('github-token')).resolves.toBe('ghp_session')
+    await expect(vault.getSecret('llm-api-key')).resolves.toBe('sk_session')
+    // Upsert works like the persistent path.
+    await vault.putSecret('github-token', 'ghp_second')
+    await expect(vault.getSecret('github-token')).resolves.toBe('ghp_second')
+  })
+
+  it('never opens the global indexedDB either (throwing-global proof)', async () => {
+    const originalIdb = globalThis.indexedDB
+    const open = vi.fn((): IDBOpenDBRequest => {
+      throw new Error('IDB open must not happen in ephemeral mode')
+    })
+    Object.defineProperty(globalThis, 'indexedDB', {
+      value: { open },
+      configurable: true,
+      writable: true,
+    })
+    try {
+      const vault = new Vault({ dbName: 'vault-ephemeral-global-proof', mode: 'ephemeral' })
+      expect(vault.isUnlocked()).toBe(true)
+      await vault.putSecret('github-token', 't')
+      await expect(vault.getSecret('github-token')).resolves.toBe('t')
+      await expect(vault.hasSecrets()).resolves.toBe(true)
+      await vault.wipeAll()
+      await expect(vault.hasSecrets()).resolves.toBe(false)
+      vault.lock()
+      expect(open).not.toHaveBeenCalled()
+    } finally {
+      Object.defineProperty(globalThis, 'indexedDB', {
+        value: originalIdb,
+        configurable: true,
+        writable: true,
+      })
+    }
+  })
+
+  it('getSecret on a missing id throws VaultError', async () => {
+    const vault = ephemeralVault()
+    await expect(vault.getSecret('github-token')).rejects.toMatchObject({
+      name: 'VaultError',
+      code: 'VAULT_NOT_FOUND',
+    })
+  })
+
+  it('lock clears the map, notifies and locks the ephemeral vault', async () => {
+    const vault = ephemeralVault()
+    const onLock = vi.fn()
+    vault.onLock(onLock)
+    await vault.putSecret('github-token', 'gone')
+    await expect(vault.hasSecrets()).resolves.toBe(true)
+    vault.lock()
+    expect(vault.isUnlocked()).toBe(false)
+    expect(onLock).toHaveBeenCalledTimes(1)
+    // Memory cleared: no secrets survive the lock.
+    await expect(vault.hasSecrets()).resolves.toBe(false)
+    await expect(vault.getSecret('github-token')).rejects.toBeInstanceOf(VaultLockedError)
+    await expect(vault.putSecret('github-token', 'x')).rejects.toBeInstanceOf(VaultLockedError)
+  })
+
+  it('wipeAll clears the map only: stays unlocked, fires onChange', async () => {
+    const vault = ephemeralVault()
+    const onChange = vi.fn()
+    vault.onChange(onChange)
+    await vault.putSecret('github-token', 't')
+    onChange.mockClear()
+    await vault.wipeAll()
+    expect(vault.isUnlocked()).toBe(true)
+    expect(onChange).toHaveBeenCalledTimes(1)
+    await expect(vault.hasSecrets()).resolves.toBe(false)
+    await expect(vault.getSecret('github-token')).rejects.toMatchObject({ code: 'VAULT_NOT_FOUND' })
+    // Still usable after a wipe.
+    await vault.putSecret('llm-api-key', 'k')
+    await expect(vault.getSecret('llm-api-key')).resolves.toBe('k')
+  })
+
+  it('setupWithPin/unlockWithPin/unlockWithPrf throw a typed VaultError on ephemeral vaults', async () => {
+    const vault = ephemeralVault()
+    await expect(vault.setupWithPin('p')).rejects.toMatchObject({
+      name: 'VaultError',
+      code: 'VAULT_EPHEMERAL',
+      message: 'vault is ephemeral',
+    })
+    await expect(vault.unlockWithPin('p')).rejects.toMatchObject({ code: 'VAULT_EPHEMERAL' })
+    // Ephemeral rejection wins even without any WebAuthn environment.
+    await expect(vault.unlockWithPrf()).rejects.toMatchObject({ code: 'VAULT_EPHEMERAL' })
+  })
+
+  it('isPrfSupported still reports the environment capability', () => {
+    const vault = ephemeralVault()
+    expect(vault.isPrfSupported()).toBe(false)
+    installPrfMock({ prfOutput: crypto.getRandomValues(new Uint8Array(32)) })
+    expect(vault.isPrfSupported()).toBe(true)
+  })
+
+  it('auto-lock clears the ephemeral map after idleTimeoutMs', async () => {
+    const onLock = vi.fn()
+    const vault = ephemeralVault({ idleTimeoutMs: 100 })
+    vault.onLock(onLock)
+    await vault.putSecret('github-token', 'session-secret')
+    await expect(vault.hasSecrets()).resolves.toBe(true)
+
+    await sleep(60)
+    expect(vault.isUnlocked()).toBe(true)
+    expect(onLock).not.toHaveBeenCalled()
+    await sleep(80)
+    expect(vault.isUnlocked()).toBe(false)
+    expect(onLock).toHaveBeenCalledTimes(1)
+    // Auto-lock wiped the in-memory secrets, not just the unlock flag.
+    await expect(vault.hasSecrets()).resolves.toBe(false)
+  })
+
+  it('notifyActivity resets the ephemeral idle timer', async () => {
+    const vault = ephemeralVault({ idleTimeoutMs: 200 })
+    await vault.putSecret('github-token', 't')
+    for (let i = 0; i < 3; i++) {
+      await sleep(90)
+      vault.notifyActivity()
+    }
+    expect(vault.isUnlocked()).toBe(true)
+    await sleep(300)
+    expect(vault.isUnlocked()).toBe(false)
+  })
+})
+
+// ---------- ephemeral -> persistent migration ----------
+
+describe('Vault ephemeral-to-persistent migration', () => {
+  it('persistToPin re-encrypts every secret into IndexedDB and switches mode in place', async () => {
+    // Migration needs a real IDB, so no throwing factory here.
+    dbCounter += 1
+    const vault = new Vault({
+      dbName: `vault-migrate-pin-${dbCounter}-${crypto.randomUUID()}`,
+      mode: 'ephemeral',
+    })
+    await vault.putSecret('github-token', 'ghp_migrate')
+    await vault.putSecret('llm-api-key', 'sk_migrate')
+    await vault.persistToPin('migrate-pin')
+
+    // Switched in place: still unlocked, secrets now governed by the PIN.
+    expect(vault.isUnlocked()).toBe(true)
+    await expect(vault.getSecret('github-token')).resolves.toBe('ghp_migrate')
+
+    const dbName = (vault as unknown as { dbName: string }).dbName
+    const records = await rawRecords(dbName)
+    expect(records).toHaveLength(2)
+    expect(records.every((r) => r.method === 1)).toBe(true)
+    // No plaintext on disk.
+    for (const rec of records) {
+      expect(recordBytes(rec)).not.toContain('ghp_migrate')
+      expect(recordBytes(rec)).not.toContain('sk_migrate')
+      expect(recordBytes(rec)).not.toContain('migrate-pin')
+    }
+
+    // Round-trip: lock, re-unlock with the PIN, read both secrets back.
+    vault.lock()
+    expect(vault.isUnlocked()).toBe(false)
+    await vault.unlockWithPin('migrate-pin')
+    await expect(vault.getSecret('github-token')).resolves.toBe('ghp_migrate')
+    await expect(vault.getSecret('llm-api-key')).resolves.toBe('sk_migrate')
+    // Wrong PIN still fails after migration.
+    vault.lock()
+    await expect(vault.unlockWithPin('wrong')).rejects.toBeInstanceOf(VaultLockedError)
+  })
+
+  it('persistToPrf bootstraps WebAuthn PRF and migrates secrets (mocked WebAuthn)', async () => {
+    const prfOutput = crypto.getRandomValues(new Uint8Array(32))
+    const credentialId = new Uint8Array([7, 7, 7, 7])
+    const get = installPrfMock({ prfOutput, credentialId })
+
+    dbCounter += 1
+    const vault = new Vault({
+      dbName: `vault-migrate-prf-${dbCounter}-${crypto.randomUUID()}`,
+      mode: 'ephemeral',
+    })
+    await vault.putSecret('github-token', 'prf_migrate')
+    await vault.persistToPrf()
+
+    expect(vault.isUnlocked()).toBe(true)
+    // Bootstrap call: no allowCredentials (nothing was stored yet).
+    const firstCall = get.mock.calls[0]![0] as { publicKey: { allowCredentials?: unknown } }
+    expect(firstCall.publicKey.allowCredentials).toBeUndefined()
+
+    const dbName = (vault as unknown as { dbName: string }).dbName
+    const records = await rawRecords(dbName)
+    expect(records).toHaveLength(1)
+    expect(records[0]!.method).toBe(2)
+    expect(new Uint8Array(records[0]!.credentialId!)).toEqual(credentialId)
+    expect(recordBytes(records[0]!)).not.toContain('prf_migrate')
+
+    // Round-trip: lock, re-unlock via PRF, read the secret back.
+    vault.lock()
+    await vault.unlockWithPrf()
+    expect(vault.isUnlocked()).toBe(true)
+    await expect(vault.getSecret('github-token')).resolves.toBe('prf_migrate')
+  })
+
+  it('persistToPin on a persistent vault throws a typed error', async () => {
+    const vault = freshVault()
+    await vault.setupWithPin('p')
+    await expect(vault.persistToPin('p2')).rejects.toMatchObject({ code: 'VAULT_NOT_EPHEMERAL' })
+    await expect(vault.persistToPrf()).rejects.toMatchObject({ code: 'VAULT_NOT_EPHEMERAL' })
+  })
+
+  it('persistToPin refuses when IndexedDB already holds records and leaves the ephemeral state intact', async () => {
+    // Seed a persistent record under the target dbName first.
+    dbCounter += 1
+    const dbName = `vault-migrate-conflict-${dbCounter}-${crypto.randomUUID()}`
+    const seeder = new Vault({ dbName })
+    await seeder.setupWithPin('seed-pin')
+    await seeder.putSecret('github-token', 'seeded')
+
+    const vault = new Vault({ dbName, mode: 'ephemeral' })
+    await vault.putSecret('llm-api-key', 'still-ephemeral')
+    await expect(vault.persistToPin('new-pin')).rejects.toMatchObject({
+      code: 'VAULT_ALREADY_SET_UP',
+    })
+    // Failed migration must not flip mode or lose the in-memory secret.
+    expect(vault.isUnlocked()).toBe(true)
+    await expect(vault.getSecret('llm-api-key')).resolves.toBe('still-ephemeral')
+  })
+
+  it('a mid-migration IndexedDB failure rolls back to ephemeral so secrets survive and retry works', async () => {
+    // First readwrite transaction (the first secret's put) fails.
+    const factory = flakyWriteFactory(1)
+    dbCounter += 1
+    const dbName = `vault-migrate-fail-${dbCounter}-${crypto.randomUUID()}`
+    const vault = new Vault({ dbName, mode: 'ephemeral', idbFactory: factory })
+    await vault.putSecret('github-token', 'ghp_survive')
+    await vault.putSecret('llm-api-key', 'sk_survive')
+
+    await expect(vault.persistToPin('retry-pin')).rejects.toThrow(/quota/)
+
+    // Still ephemeral and unlocked: the not-yet-migrated secrets stay
+    // reachable (the mode flip must happen only after every write lands).
+    expect(vault.isUnlocked()).toBe(true)
+    await expect(vault.getSecret('github-token')).resolves.toBe('ghp_survive')
+    await expect(vault.getSecret('llm-api-key')).resolves.toBe('sk_survive')
+
+    // The half-written record was rolled back: the store is empty.
+    await expect(rawRecords(dbName)).resolves.toEqual([])
+
+    // Retrying 'Remember' works — no VAULT_NOT_EPHEMERAL dead end.
+    await vault.persistToPin('retry-pin')
+    expect(vault.isUnlocked()).toBe(true)
+    await expect(vault.getSecret('github-token')).resolves.toBe('ghp_survive')
+    await expect(vault.getSecret('llm-api-key')).resolves.toBe('sk_survive')
+    const records = await rawRecords(dbName)
+    expect(records).toHaveLength(2)
+
+    // Round-trip through the PIN after the successful retry.
+    vault.lock()
+    await vault.unlockWithPin('retry-pin')
+    await expect(vault.getSecret('llm-api-key')).resolves.toBe('sk_survive')
+  })
+})
+
+// ---------- hasSecrets ----------
+
+describe('Vault hasSecrets', () => {
+  it('ephemeral: tracks the in-memory map only', async () => {
+    const vault = ephemeralVault()
+    await expect(vault.hasSecrets()).resolves.toBe(false)
+    await vault.putSecret('github-token', 't')
+    await expect(vault.hasSecrets()).resolves.toBe(true)
+    await vault.wipeAll()
+    await expect(vault.hasSecrets()).resolves.toBe(false)
+  })
+
+  it('persistent: reflects IndexedDB records across instances', async () => {
+    dbCounter += 1
+    const dbName = `vault-hassecrets-${dbCounter}-${crypto.randomUUID()}`
+    const writer = new Vault({ dbName })
+    await expect(writer.hasSecrets()).resolves.toBe(false)
+    await writer.setupWithPin('p')
+    await writer.putSecret('github-token', 't')
+    await expect(writer.hasSecrets()).resolves.toBe(true)
+
+    // A fresh instance on the same dbName sees the persisted records.
+    const reader = new Vault({ dbName })
+    await expect(reader.hasSecrets()).resolves.toBe(true)
+    await reader.wipeAll()
+    await expect(reader.hasSecrets()).resolves.toBe(false)
   })
 })

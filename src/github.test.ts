@@ -3,13 +3,20 @@ import {
   NonImageError,
   extractImageUrls,
   extractMermaidBlocks,
+  fetchCommit,
+  fetchCompare,
+  fetchFileContent,
   fetchImageAsDataUrl,
   fetchNewCommits,
   fetchPullRequest,
   filterGeneratedFiles,
   findPrUrl,
+  parseGitTarget,
   parsePrInput,
   parsePrUrl,
+  pseudoRefNumber,
+  pseudoTargetRef,
+  PSEUDO_REF_FLOOR,
 } from './github'
 import type { PrFile } from './types'
 
@@ -21,6 +28,7 @@ interface MockRes {
   headers: { get(name: string): string | null }
   json(): Promise<unknown>
   arrayBuffer(): Promise<ArrayBuffer>
+  text?(): Promise<string>
 }
 
 function jsonRes(body: unknown, opts: { status?: number; headers?: Record<string, string> } = {}): MockRes {
@@ -47,6 +55,18 @@ function bytesRes(bytes: Uint8Array, contentType: string): MockRes {
     headers: { get: (name: string) => (name.toLowerCase() === 'content-type' ? contentType : null) },
     json: () => Promise.reject(new Error('not json')),
     arrayBuffer: () => Promise.resolve(bytes.slice().buffer as ArrayBuffer),
+  }
+}
+
+function textRes(body: string, opts: { status?: number } = {}): MockRes {
+  const status = opts.status ?? 200
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => null },
+    json: () => Promise.reject(new Error('not json')),
+    arrayBuffer: () => Promise.reject(new Error('not binary')),
+    text: () => Promise.resolve(body),
   }
 }
 
@@ -665,5 +685,395 @@ describe('fetchImageAsDataUrl', () => {
     )
     expect((err as Error).message).not.toContain(TOKEN)
     expect((err as Error).message).toContain('[REDACTED]')
+  })
+})
+
+// ---------- parseGitTarget ----------
+
+describe('parseGitTarget', () => {
+  it('passes PR URLs and shorthand through as kind pr', () => {
+    expect(parseGitTarget('https://github.com/octo/repo/pull/9')).toEqual({
+      kind: 'pr',
+      ref: { owner: 'octo', repo: 'repo', number: 9 },
+    })
+    expect(parseGitTarget('github.com/octo/repo/pull/9/files?diff=split')).toEqual({
+      kind: 'pr',
+      ref: { owner: 'octo', repo: 'repo', number: 9 },
+    })
+    expect(parseGitTarget('octo/repo#9')).toEqual({
+      kind: 'pr',
+      ref: { owner: 'octo', repo: 'repo', number: 9 },
+    })
+  })
+
+  it('parses blob and raw github.com file URLs', () => {
+    expect(parseGitTarget('https://github.com/octo/repo/blob/main/src/a.ts')).toEqual({
+      kind: 'file',
+      file: { owner: 'octo', repo: 'repo', ref: 'main', path: 'src/a.ts' },
+    })
+    expect(parseGitTarget('github.com/octo/repo/raw/v1.2.0/docs/readme.md')).toEqual({
+      kind: 'file',
+      file: { owner: 'octo', repo: 'repo', ref: 'v1.2.0', path: 'docs/readme.md' },
+    })
+  })
+
+  it('parses raw.githubusercontent.com URLs', () => {
+    expect(parseGitTarget('https://raw.githubusercontent.com/octo/repo/main/src/a.ts')).toEqual({
+      kind: 'file',
+      file: { owner: 'octo', repo: 'repo', ref: 'main', path: 'src/a.ts' },
+    })
+  })
+
+  it('drops query strings and fragments from file paths', () => {
+    expect(parseGitTarget('https://github.com/octo/repo/blob/main/src/a.ts?plain=1#L4')).toEqual({
+      kind: 'file',
+      file: { owner: 'octo', repo: 'repo', ref: 'main', path: 'src/a.ts' },
+    })
+  })
+
+  it('parses commit URLs', () => {
+    expect(parseGitTarget('https://github.com/octo/repo/commit/abc123def456789abc123')).toEqual({
+      kind: 'commit',
+      commit: { owner: 'octo', repo: 'repo', sha: 'abc123def456789abc123' },
+    })
+    expect(parseGitTarget('github.com/octo/repo/commit/deadbeef')).toEqual({
+      kind: 'commit',
+      commit: { owner: 'octo', repo: 'repo', sha: 'deadbeef' },
+    })
+  })
+
+  it('parses compare URLs', () => {
+    expect(parseGitTarget('https://github.com/octo/repo/compare/main...feature-x')).toEqual({
+      kind: 'compare',
+      compare: { owner: 'octo', repo: 'repo', base: 'main', head: 'feature-x' },
+    })
+    expect(parseGitTarget('github.com/octo/repo/compare/v1.0...v2.0')).toEqual({
+      kind: 'compare',
+      compare: { owner: 'octo', repo: 'repo', base: 'v1.0', head: 'v2.0' },
+    })
+  })
+
+  it('parses two-dot compare URLs (base..head)', () => {
+    expect(parseGitTarget('https://github.com/octo/repo/compare/main..feature-x')).toEqual({
+      kind: 'compare',
+      compare: { owner: 'octo', repo: 'repo', base: 'main', head: 'feature-x' },
+    })
+    expect(parseGitTarget('github.com/octo/repo/compare/v1.0..v2.0')).toEqual({
+      kind: 'compare',
+      compare: { owner: 'octo', repo: 'repo', base: 'v1.0', head: 'v2.0' },
+    })
+  })
+
+  it('matches hosts case-insensitively', () => {
+    expect(parseGitTarget('https://GITHUB.Com/octo/repo/blob/main/a.ts')).toEqual({
+      kind: 'file',
+      file: { owner: 'octo', repo: 'repo', ref: 'main', path: 'a.ts' },
+    })
+  })
+
+  it('returns null for garbage and non-github input', () => {
+    expect(parseGitTarget('hello world')).toBeNull()
+    expect(parseGitTarget('')).toBeNull()
+    expect(parseGitTarget('https://gitlab.com/octo/repo/pull/9')).toBeNull()
+    expect(parseGitTarget('github.com/octo/repo/issues/9')).toBeNull()
+    expect(parseGitTarget('github.com/octo/repo/wiki')).toBeNull()
+    expect(parseGitTarget('https://example.com/octo/repo/blob/main/a.ts')).toBeNull()
+  })
+})
+
+// ---------- fetchFileContent ----------
+
+describe('pseudo-PR refs', () => {
+  it('pseudoRefNumber is deterministic and never collides for distinct seeds', () => {
+    expect(pseudoRefNumber('file:main:src/a.ts')).toBe(pseudoRefNumber('file:main:src/a.ts'))
+    expect(pseudoRefNumber('file:main:src/a.ts')).not.toBe(pseudoRefNumber('file:main:src/b.ts'))
+    expect(pseudoRefNumber('commit:abc')).not.toBe(pseudoRefNumber('commit:def'))
+    expect(pseudoRefNumber('compare:main...a')).not.toBe(pseudoRefNumber('compare:main...b'))
+    expect(pseudoRefNumber('compare:main...a')).not.toBe(pseudoRefNumber('compare:dev...a'))
+  })
+
+  it('pseudo numbers sit at or above PSEUDO_REF_FLOOR, out of real-PR range', () => {
+    expect(pseudoRefNumber('x')).toBeGreaterThanOrEqual(PSEUDO_REF_FLOOR)
+    expect(pseudoRefNumber('x')).toBeLessThan(PSEUDO_REF_FLOOR + 900_000_000)
+  })
+
+  it('pseudoTargetRef keys each target kind by its unique identity', () => {
+    const fileA = pseudoTargetRef({ kind: 'file', file: { owner: 'o', repo: 'r', ref: 'main', path: 'a.ts' } })
+    const fileB = pseudoTargetRef({ kind: 'file', file: { owner: 'o', repo: 'r', ref: 'main', path: 'b.ts' } })
+    expect(fileA).toEqual({ owner: 'o', repo: 'r', number: pseudoRefNumber('file:main:a.ts') })
+    expect(fileA.number).not.toBe(fileB.number)
+    const commit = pseudoTargetRef({ kind: 'commit', commit: { owner: 'o', repo: 'r', sha: 'abc123' } })
+    expect(commit).toEqual({ owner: 'o', repo: 'r', number: pseudoRefNumber('commit:abc123') })
+    const cmp1 = pseudoTargetRef({ kind: 'compare', compare: { owner: 'o', repo: 'r', base: 'main', head: 'feat1' } })
+    const cmp2 = pseudoTargetRef({ kind: 'compare', compare: { owner: 'o', repo: 'r', base: 'main', head: 'feat2' } })
+    expect(cmp1.number).not.toBe(cmp2.number)
+    const pr = { owner: 'o', repo: 'r', number: 7 }
+    expect(pseudoTargetRef({ kind: 'pr', ref: pr })).toBe(pr)
+  })
+})
+
+describe('fetchFileContent', () => {
+  const TARGET = { owner: 'octo', repo: 'repo', ref: 'main', path: 'src/a.ts' }
+  const RAW_URL = 'https://raw.githubusercontent.com/octo/repo/main/src/a.ts'
+  const API_URL = 'https://api.github.com/repos/octo/repo/contents/src/a.ts?ref=main'
+
+  it('fetches the raw URL and maps content into title/body/patch', async () => {
+    fetchMock.mockResolvedValue(textRes('file body\nline 2'))
+
+    const data = await fetchFileContent(TARGET, TOKEN)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0]![0]).toBe(RAW_URL)
+    const init = fetchMock.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`)
+
+    expect(data.ref).toEqual({ owner: 'octo', repo: 'repo', number: pseudoRefNumber('file:main:src/a.ts') })
+    expect(data.title).toBe('a.ts')
+    expect(data.body).toBe('File content:\nfile body\nline 2')
+    expect(data.author).toBe('octo')
+    expect(data.additions).toBe(0)
+    expect(data.deletions).toBe(0)
+    expect(data.changedFiles).toBe(1)
+    expect(data.files).toHaveLength(1)
+    expect(data.files[0]).toEqual({
+      filename: 'src/a.ts',
+      status: 'added',
+      additions: 0,
+      deletions: 0,
+      patch: 'file body\nline 2',
+    })
+    expect(data.headSha).toBeUndefined()
+    expect(data.comments).toEqual([])
+    expect(data.reviews).toEqual([])
+  })
+
+  it('sends no Authorization header when the token is empty', async () => {
+    fetchMock.mockResolvedValue(textRes('public content'))
+
+    await fetchFileContent(TARGET, '')
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const init = fetchMock.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers.Authorization).toBeUndefined()
+  })
+
+  it('keys two different files onto different refs (no resume/listen collision)', async () => {
+    fetchMock.mockResolvedValue(textRes('x'))
+
+    const a = await fetchFileContent(TARGET, '')
+    const b = await fetchFileContent({ ...TARGET, path: 'src/b.ts' }, '')
+
+    expect(a.ref.number).not.toBe(b.ref.number)
+  })
+
+  it('falls back to the API contents endpoint when raw returns 404 with a token', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url === RAW_URL) return Promise.resolve(jsonRes({ message: 'Not Found' }, { status: 404 }))
+      if (url === API_URL) return Promise.resolve(textRes('private content'))
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+
+    const data = await fetchFileContent(TARGET, TOKEN)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]![0]).toBe(API_URL)
+    const init = fetchMock.mock.calls[1]![1] as { headers: Record<string, string> }
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`)
+    expect(init.headers.Accept).toBe('application/vnd.github.raw')
+
+    expect(data.title).toBe('a.ts')
+    expect(data.files[0]!.patch).toBe('private content')
+    expect(data.body).toBe('File content:\nprivate content')
+  })
+
+  it('falls back to the API contents endpoint when raw returns 401 with a token', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url === RAW_URL) return Promise.resolve(jsonRes({ message: 'Unauthorized' }, { status: 401 }))
+      if (url === API_URL) return Promise.resolve(textRes('via api'))
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+
+    const data = await fetchFileContent(TARGET, TOKEN)
+    expect(data.files[0]!.patch).toBe('via api')
+  })
+
+  it('throws the raw error without a token on 404 (no API fallback attempted)', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url === RAW_URL) return Promise.resolve(jsonRes({ message: 'Not Found' }, { status: 404 }))
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+
+    await expect(fetchFileContent(TARGET, '')).rejects.toThrow(/404/)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('throws an actionable message when raw 404s with no token', async () => {
+    fetchMock.mockResolvedValue(jsonRes({ message: 'Not Found' }, { status: 404 }))
+
+    await expect(fetchFileContent(TARGET, '')).rejects.toThrow(/Not Found/)
+  })
+
+  it('sanitizes the token out of network errors', async () => {
+    fetchMock.mockRejectedValue(new Error(`connect ECONNREFUSED with ${TOKEN}`))
+
+    const err = await fetchFileContent(TARGET, TOKEN).catch((e: unknown) => e)
+    expect((err as Error).message).not.toContain(TOKEN)
+    expect((err as Error).message).toContain('[REDACTED]')
+  })
+})
+
+// ---------- fetchCommit ----------
+
+describe('fetchCommit', () => {
+  const COMMIT_URL = 'https://api.github.com/repos/octo/repo/commits/abc123'
+
+  it('maps the commit into PullRequestData with generated files filtered', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url !== COMMIT_URL) return Promise.reject(new Error(`unexpected fetch: ${url}`))
+      return Promise.resolve(
+        jsonRes({
+          sha: 'abc123',
+          commit: { message: 'fix: handle empty input\n\nlong body here' },
+          author: { login: 'dev1' },
+          stats: { additions: 9, deletions: 4 },
+          files: [
+            { filename: 'src/a.ts', status: 'modified', additions: 8, deletions: 3, patch: '@@ -1 +1 @@' },
+            { filename: 'package-lock.json', status: 'modified', additions: 1, deletions: 1 },
+          ],
+        }),
+      )
+    })
+
+    const data = await fetchCommit('octo', 'repo', 'abc123', TOKEN)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const init = fetchMock.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`)
+    expect(init.headers.Accept).toBe('application/vnd.github+json')
+
+    expect(data.ref).toEqual({ owner: 'octo', repo: 'repo', number: pseudoRefNumber('commit:abc123') })
+    expect(data.title).toBe('fix: handle empty input')
+    expect(data.body).toContain('long body here')
+    expect(data.author).toBe('dev1')
+    expect(data.headSha).toBe('abc123')
+    expect(data.additions).toBe(9)
+    expect(data.deletions).toBe(4)
+    expect(data.files.map((f) => f.filename)).toEqual(['src/a.ts'])
+    expect(data.files[0]!.patch).toBe('@@ -1 +1 @@')
+    expect(data.changedFiles).toBe(1)
+    expect(data.comments).toEqual([])
+    expect(data.reviews).toEqual([])
+  })
+
+  it('defaults author and sha when the payload lacks them', async () => {
+    fetchMock.mockResolvedValue(
+      jsonRes({ commit: { message: 'solo commit' }, files: [] }),
+    )
+
+    const data = await fetchCommit('octo', 'repo', 'fede123', '')
+    expect(data.author).toBe('unknown')
+    expect(data.headSha).toBe('fede123')
+    expect(data.title).toBe('solo commit')
+    expect(data.files).toEqual([])
+
+    // unauthenticated: no Authorization header
+    const init = fetchMock.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers.Authorization).toBeUndefined()
+  })
+
+  it('throws a sanitized error on HTTP failure', async () => {
+    fetchMock.mockResolvedValue(jsonRes({ message: 'Not Found' }, { status: 404 }))
+    await expect(fetchCommit('octo', 'repo', 'nope', TOKEN)).rejects.toThrow(/404/)
+  })
+})
+
+// ---------- fetchCompare ----------
+
+describe('fetchCompare', () => {
+  const COMPARE_URL = 'https://api.github.com/repos/octo/repo/compare/main...feat-x'
+
+  it('maps the compare into PullRequestData with generated files filtered', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url !== COMPARE_URL) return Promise.reject(new Error(`unexpected fetch: ${url}`))
+      return Promise.resolve(
+        jsonRes({
+          merge_base_commit: { sha: 'mb0001' },
+          commits: [
+            { sha: 'c0001', author: { login: 'alice' } },
+            { sha: 'c0002', author: { login: 'bob' } },
+          ],
+          files: [
+            { filename: 'src/x.ts', status: 'modified', additions: 5, deletions: 2, patch: '@@ -1 +1 @@' },
+            { filename: 'dist/y.js', status: 'modified', additions: 100, deletions: 0 },
+          ],
+        }),
+      )
+    })
+
+    const data = await fetchCompare('octo', 'repo', 'main', 'feat-x', TOKEN)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const init = fetchMock.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`)
+
+    expect(data.ref).toEqual({ owner: 'octo', repo: 'repo', number: pseudoRefNumber('compare:main...feat-x') })
+    expect(data.title).toBe('main...feat-x')
+    // headSha combines the merge base with the head commit sha
+    expect(data.headSha).toBe('mb0001..c0002')
+    // last commit's author
+    expect(data.author).toBe('bob')
+    // additions/deletions summed over kept files only (dist/y.js dropped)
+    expect(data.additions).toBe(5)
+    expect(data.deletions).toBe(2)
+    expect(data.files.map((f) => f.filename)).toEqual(['src/x.ts'])
+    expect(data.files[0]!.patch).toBe('@@ -1 +1 @@')
+    expect(data.changedFiles).toBe(1)
+    expect(data.body).toContain('2 commits')
+    expect(data.comments).toEqual([])
+    expect(data.reviews).toEqual([])
+  })
+
+  it('falls back to the base/head refs when the payload lacks shas', async () => {
+    fetchMock.mockResolvedValue(jsonRes({ commits: [], files: [] }))
+
+    const data = await fetchCompare('octo', 'repo', 'v1.0', 'v2.0', '')
+    expect(data.headSha).toBe('v1.0..v2.0')
+    expect(data.author).toBe('unknown')
+    expect(data.title).toBe('v1.0...v2.0')
+    expect(data.files).toEqual([])
+
+    // unauthenticated: no Authorization header
+    const init = fetchMock.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers.Authorization).toBeUndefined()
+  })
+
+  it('two compares into the same base never share a transcript-cache key', async () => {
+    // Both ranges report the SAME merge base (sha of main): keying the
+    // cache on the merge base alone made compare/main...feat1 and
+    // compare/main...feat2 collide on 'octo/repo#0@<merge-base>'.
+    fetchMock.mockImplementation((url: string) => {
+      const head = url.endsWith('main...feat-x') ? 'c0002' : 'c0003'
+      return Promise.resolve(
+        jsonRes({
+          merge_base_commit: { sha: 'mb0001' },
+          commits: [{ sha: head, author: { login: 'alice' } }],
+          files: [{ filename: 'src/x.ts', status: 'modified', additions: 1, deletions: 1 }],
+        }),
+      )
+    })
+
+    const one = await fetchCompare('octo', 'repo', 'main', 'feat-x', TOKEN)
+    const two = await fetchCompare('octo', 'repo', 'main', 'feat-y', TOKEN)
+
+    expect(one.headSha).not.toBe(two.headSha)
+    expect(one.ref.number).not.toBe(two.ref.number)
+    expect(`${one.ref.owner}/${one.ref.repo}#${one.ref.number}@${one.headSha}`).not.toBe(
+      `${two.ref.owner}/${two.ref.repo}#${two.ref.number}@${two.headSha}`,
+    )
+  })
+
+  it('throws a sanitized error on HTTP failure', async () => {
+    fetchMock.mockResolvedValue(jsonRes({ message: 'Not Found' }, { status: 404 }))
+    await expect(fetchCompare('octo', 'repo', 'a', 'b', TOKEN)).rejects.toThrow(/404/)
   })
 })

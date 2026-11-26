@@ -532,3 +532,183 @@ describe('initialStreamStatus', () => {
     expect(app.initialStreamStatus(null, false)).toBeNull()
   })
 })
+
+describe('routeInput', () => {
+  it('routes PR URLs and shorthand to the pr path', () => {
+    const r1 = app.routeInput('https://github.com/octocat/hello/pull/42')
+    expect(r1).toEqual({ kind: 'pr', ref: { owner: 'octocat', repo: 'hello', number: 42 } })
+    const r2 = app.routeInput('octocat/hello#42')
+    expect(r2).toEqual({ kind: 'pr', ref: { owner: 'octocat', repo: 'hello', number: 42 } })
+  })
+
+  it('routes blob, raw, commit and compare URLs to their fetchers', () => {
+    expect(app.routeInput('https://github.com/o/r/blob/main/src/a.ts')).toEqual({
+      kind: 'file',
+      file: { owner: 'o', repo: 'r', ref: 'main', path: 'src/a.ts' },
+    })
+    expect(app.routeInput('https://raw.githubusercontent.com/o/r/v1/lib/b.ts')).toEqual({
+      kind: 'file',
+      file: { owner: 'o', repo: 'r', ref: 'v1', path: 'lib/b.ts' },
+    })
+    expect(app.routeInput('https://github.com/o/r/commit/abc1234')).toEqual({
+      kind: 'commit',
+      commit: { owner: 'o', repo: 'r', sha: 'abc1234' },
+    })
+    expect(app.routeInput('https://github.com/o/r/compare/v1...v2')).toEqual({
+      kind: 'compare',
+      compare: { owner: 'o', repo: 'r', base: 'v1', head: 'v2' },
+    })
+  })
+
+  it('routes multiline or long free text to the paste parser', () => {
+    const pasted = '# Fix login\n\nThe session cookie was not refreshed.\n\ndiff --git a/auth.ts b/auth.ts'
+    const r = app.routeInput(pasted)
+    expect(r.kind).toBe('paste')
+    if (r.kind === 'paste') expect(r.text).toBe(pasted.trim())
+    const long = 'x'.repeat(100)
+    expect(app.routeInput(long).kind).toBe('paste')
+  })
+
+  it('rejects short single-line garbage with a clear error', () => {
+    const r = app.routeInput('hello world')
+    expect(r.kind).toBe('error')
+    if (r.kind === 'error') expect(r.message).toMatch(/GitHub pull request/)
+    expect(app.routeInput('').kind).toBe('error')
+  })
+})
+
+describe('parseDetailSetting', () => {
+  it('returns detailed only for the exact persisted value', () => {
+    expect(app.parseDetailSetting('detailed')).toBe('detailed')
+    expect(app.parseDetailSetting('brief')).toBe('brief')
+    expect(app.parseDetailSetting(null)).toBe('brief')
+    expect(app.parseDetailSetting('')).toBe('brief')
+    expect(app.parseDetailSetting('DETAILS')).toBe('brief')
+  })
+})
+
+describe('bigPrStatus', () => {
+  const base = {
+    ref: { owner: 'o', repo: 'r', number: 1 },
+    title: 't',
+    body: '',
+    author: 'a',
+    additions: 1,
+    deletions: 1,
+    changedFiles: 2,
+    files: [],
+    comments: [],
+    reviews: [],
+    imageUrls: [],
+    mermaidBlocks: [],
+  }
+
+  it('is null when nothing was filtered or the source reports no raw count', () => {
+    expect(app.bigPrStatus({ ...base, rawChangedFiles: 2 })).toBeNull()
+    expect(app.bigPrStatus({ ...base, rawChangedFiles: 1 })).toBeNull()
+    expect(app.bigPrStatus(base)).toBeNull()
+  })
+
+  it('names the kept and raw counts when generated files were skipped', () => {
+    expect(app.bigPrStatus({ ...base, rawChangedFiles: 5 })).toBe(
+      'Showing 2 of 5 changed files (lockfiles/generated skipped)',
+    )
+  })
+})
+
+describe('fileChipHref', () => {
+  it('links real PRs to the PR files tab', () => {
+    expect(
+      app.fileChipHref({ owner: 'o', repo: 'r', number: 7 }, null, 'src/a.ts'),
+    ).toBe('https://github.com/o/r/pull/7/files')
+  })
+
+  it('links file-target loads to the blob URL, encoding the path', () => {
+    expect(
+      app.fileChipHref(
+        { owner: 'o', repo: 'r', number: 0 },
+        { owner: 'o', repo: 'r', ref: 'main', path: 'src/a.ts' },
+        'src/a b.ts',
+      ),
+    ).toBe('https://github.com/o/r/blob/main/src/a%20b.ts')
+  })
+
+  it('returns null for pasted content and pseudo-PRs without a file target', () => {
+    expect(app.fileChipHref({ owner: 'pasted', repo: 'content', number: 0 }, null, 'a.ts')).toBeNull()
+    expect(app.fileChipHref(null, null, 'a.ts')).toBeNull()
+  })
+
+  it('never links pseudo-PR refs (numbers at or above the pseudo floor) to a PR page', () => {
+    expect(app.fileChipHref({ owner: 'pasted', repo: 'content', number: 1_234_567_890 }, null, 'a.ts')).toBeNull()
+    expect(app.fileChipHref({ owner: 'o', repo: 'r', number: 1_900_000_000 }, null, 'a.ts')).toBeNull()
+  })
+})
+
+describe('retryStatusMessage', () => {
+  it('rounds the backoff up to at least one second', () => {
+    expect(app.retryStatusMessage(0)).toBe('Retrying in 1s…')
+    expect(app.retryStatusMessage(1500)).toBe('Retrying in 2s…')
+    expect(app.retryStatusMessage(8000)).toBe('Retrying in 8s…')
+  })
+})
+
+describe('demo transcript', () => {
+  it('ships four narrated sections with files and a mermaid block', () => {
+    expect(app.DEMO_TRANSCRIPT.sections).toHaveLength(4)
+    for (const s of app.DEMO_TRANSCRIPT.sections) {
+      expect(s.title).toBeTruthy()
+      expect(s.sentences.length).toBeGreaterThanOrEqual(2)
+    }
+    const withFiles = app.DEMO_TRANSCRIPT.sections.filter((s) => (s.files ?? []).length > 0)
+    expect(withFiles.length).toBeGreaterThanOrEqual(2)
+    expect(app.DEMO_MERMAID_BLOCKS.length).toBeGreaterThanOrEqual(1)
+    expect(app.DEMO_MERMAID_BLOCKS[0]).toMatch(/^flowchart/)
+    expect(app.DEMO_REF).toEqual({ owner: 'demo', repo: 'sample', number: 0 })
+  })
+})
+
+describe('BOOKMARKLET_HREF', () => {
+  it('hops to ListenToPR with the current page URL as the pr parameter', () => {
+    expect(app.BOOKMARKLET_HREF).toContain("javascript:location.href='https://github.tig.pw/listentopr/?pr='+encodeURIComponent(location.href)")
+  })
+})
+
+describe('copyBookmarklet', () => {
+  const originalNavigator = globalThis.navigator
+
+  it('copies the bookmarklet URL and reports it', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('navigator', { clipboard: { writeText } })
+    try {
+      const msg = await app.copyBookmarklet()
+      expect(writeText).toHaveBeenCalledTimes(1)
+      expect(writeText).toHaveBeenCalledWith(app.BOOKMARKLET_HREF)
+      expect(msg).toContain('Bookmarklet copied')
+    } finally {
+      vi.stubGlobal('navigator', originalNavigator)
+    }
+  })
+
+  it('falls back to the drag hint when the clipboard is unavailable', async () => {
+    vi.stubGlobal('navigator', {})
+    try {
+      const msg = await app.copyBookmarklet()
+      expect(msg).toContain('drag')
+    } finally {
+      vi.stubGlobal('navigator', originalNavigator)
+    }
+  })
+})
+
+describe('pinOnlyVaultMessage', () => {
+  it('points at the biometric unlock when this screen offers one', () => {
+    expect(app.pinOnlyVaultMessage(true)).toContain('biometric unlock')
+    expect(app.pinOnlyVaultMessage(true)).not.toContain('Wipe')
+  })
+
+  it('points at the wipe escape hatch when no biometric unlock exists here', () => {
+    const msg = app.pinOnlyVaultMessage(false)
+    expect(msg).toContain('unavailable')
+    expect(msg).toContain('Wipe vault and start fresh')
+  })
+})

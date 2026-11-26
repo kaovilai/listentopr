@@ -1200,3 +1200,210 @@ describe('buildTranscript with budget', () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// Section files (file-link chips)
+// ---------------------------------------------------------------------------
+
+function findChangesCall(calls: RecordedCall[]): RecordedCall {
+  const call = calls.find((c) => c.messages[1]!.text.includes('Files in this batch'))
+  expect(call).toBeDefined()
+  return call!
+}
+
+describe('section files parsing and validation', () => {
+  it('parses files from a stream section, keeping only filenames in that call input', async () => {
+    const { chat: fake } = recordChat(() =>
+      JSON.stringify({
+        title: 'Changes',
+        sentences: ['The widgets gained a helper.'],
+        summary: 'helper',
+        files: ['src/a.ts', 'made-up.ts', 'src/b.ts', 42, ''],
+      }),
+    )
+    const stream = createTranscriptStream(config, makeStreamPr(), { chat: fake })
+    const sections = await drain(stream)
+    const changes = sections.find((s) => s.id.startsWith('changes'))!
+    expect(changes.files).toEqual(['src/a.ts', 'src/b.ts'])
+  })
+
+  it('filters per call: a filename from a later batch is not accepted early', async () => {
+    const pr = makeStreamPr({ files: makeFiles(12) })
+    const { chat: fake } = recordChat((call) => {
+      if (call.messages[1]!.text.includes('batch 1 of')) {
+        // second-batch filename claimed by the first batch's reply
+        return JSON.stringify({
+          title: 'B1',
+          sentences: ['First batch.'],
+          files: ['src/f0.ts', 'src/f10.ts'],
+        })
+      }
+      return sectionJson(1)
+    })
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const sections = await drain(stream)
+    const firstChanges = sections.find((s) => s.id === 'changes-1')!
+    expect(firstChanges.files).toEqual(['src/f0.ts'])
+  })
+
+  it('drops the files field when the model invents filenames', async () => {
+    const { chat: fake } = recordChat(() =>
+      JSON.stringify({
+        title: 'Changes',
+        sentences: ['Words were spoken.'],
+        files: ['nope.ts', 'also-nope.rs'],
+      }),
+    )
+    const stream = createTranscriptStream(config, makeStreamPr(), { chat: fake })
+    const sections = await drain(stream)
+    for (const s of sections) expect(s.files).toBeUndefined()
+  })
+
+  it('dedupes and caps parsed files at 8', async () => {
+    const pr = makeStreamPr({ files: makeFiles(9) })
+    const { chat: fake } = recordChat(() =>
+      JSON.stringify({
+        title: 'B',
+        sentences: ['Many files changed.'],
+        files: [
+          'src/f0.ts', 'src/f0.ts', 'src/f1.ts', 'src/f2.ts', 'src/f3.ts',
+          'src/f4.ts', 'src/f5.ts', 'src/f6.ts', 'src/f7.ts', 'src/f8.ts',
+        ],
+      }),
+    )
+    const stream = createTranscriptStream(config, pr, { chat: fake })
+    const sections = await drain(stream)
+    const changes = sections.find((s) => s.id.startsWith('changes'))!
+    expect(changes.files).toEqual([
+      'src/f0.ts', 'src/f1.ts', 'src/f2.ts', 'src/f3.ts',
+      'src/f4.ts', 'src/f5.ts', 'src/f6.ts', 'src/f7.ts',
+    ])
+  })
+
+  it('parses files in buildTranscript sections, filtered to the PR files', async () => {
+    const reply = JSON.stringify({
+      title: 'Caching layer',
+      sections: [
+        {
+          id: 'changes',
+          title: 'Key Changes',
+          sentences: ['The cache module gained a Map.'],
+          files: ['src/cache.ts', 'invented.ts', 'README.md'],
+        },
+        { id: 'overview', title: 'Overview', sentences: ['This PR adds caching.'] },
+      ],
+    })
+    stubFetch(() => okResponse(reply))
+    const transcript = await buildTranscript(config, makePr())
+    const changes = transcript.sections.find((s) => s.id === 'changes')!
+    expect(changes.files).toEqual(['src/cache.ts', 'README.md'])
+    const overview = transcript.sections.find((s) => s.id === 'overview')!
+    expect(overview.files).toBeUndefined()
+  })
+
+  it('keeps delta section files only when the filename appears in the delta prompt', async () => {
+    const commits = [
+      { sha: 'new0003', message: 'fix: guard src/cache.ts against empty input', date: '2026-11-22T10:00:00Z' },
+    ]
+    const { chat: fake } = recordChat(() =>
+      JSON.stringify({
+        title: 'Update',
+        sentences: ['The guard landed.'],
+        files: ['src/cache.ts', 'unmentioned.ts'],
+      }),
+    )
+    const section = await buildDeltaSection(config, makePr(), commits, 'previous summary', {
+      chat: fake,
+    })
+    expect(section.files).toEqual(['src/cache.ts'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Detail mode
+// ---------------------------------------------------------------------------
+
+describe('detail mode', () => {
+  it('brief keeps the intent-level instruction; detailed swaps in removals/additions with per-file counts', async () => {
+    const { calls: briefCalls, chat: briefChat } = recordChat(defaultResponder)
+    await drain(createTranscriptStream(config, makeStreamPr(), { chat: briefChat }))
+    const { calls: detailedCalls, chat: detailedChat } = recordChat(defaultResponder)
+    await drain(
+      createTranscriptStream(config, makeStreamPr(), { chat: detailedChat, detail: 'detailed' }),
+    )
+
+    const brief = findChangesCall(briefCalls)
+    const detailed = findChangesCall(detailedCalls)
+
+    expect(brief.messages[0]!.text).toContain('intent and logic flow')
+    expect(brief.messages[0]!.text).not.toContain('state removals and additions')
+    expect(brief.messages[1]!.text).not.toContain('Per-file additions/deletions')
+
+    expect(detailed.messages[0]!.text).toContain(
+      'state removals and additions as separate statements, using the per-file +N/-M counts provided',
+    )
+    expect(detailed.messages[1]!.text).toContain('Per-file additions/deletions')
+    expect(detailed.messages[1]!.text).toContain('src/a.ts: +5 additions, -1 deletions')
+    expect(detailed.messages[1]!.text).toContain('src/b.ts: +5 additions, -1 deletions')
+
+    // prompts genuinely differ between modes
+    expect(brief.messages[0]!.text).not.toEqual(detailed.messages[0]!.text)
+    expect(brief.messages[1]!.text).not.toEqual(detailed.messages[1]!.text)
+  })
+
+  it('both detail modes request files in the section JSON schema', async () => {
+    const { calls: briefCalls, chat: briefChat } = recordChat(defaultResponder)
+    await drain(createTranscriptStream(config, makeStreamPr(), { chat: briefChat }))
+    const { calls: detailedCalls, chat: detailedChat } = recordChat(defaultResponder)
+    await drain(
+      createTranscriptStream(config, makeStreamPr(), { chat: detailedChat, detail: 'detailed' }),
+    )
+    for (const call of [...briefCalls, ...detailedCalls]) {
+      expect(call.messages[0]!.text).toContain('"files": string[]')
+    }
+  })
+
+  it('buildTranscript detailed: system prompt swaps the changes instruction and the user prompt carries per-file counts', async () => {
+    const reply = JSON.stringify({
+      title: 'T',
+      sections: [{ id: 'changes', title: 'Changes', sentences: ['Sentence.'] }],
+    })
+    const briefFetch = stubFetch(() => okResponse(reply))
+    await buildTranscript(config, makePr())
+    const briefBody = JSON.parse(briefFetch.mock.calls[0]![1].body as string)
+
+    const detailedFetch = stubFetch(() => okResponse(reply))
+    await buildTranscript(config, makePr(), { detail: 'detailed' })
+    const detailedBody = JSON.parse(detailedFetch.mock.calls[0]![1].body as string)
+
+    expect(briefBody.messages[0].content).toContain('intent and logic flow')
+    expect(briefBody.messages[0].content).not.toContain('state removals and additions')
+    expect(detailedBody.messages[0].content).toContain(
+      'state removals and additions as separate statements, using the per-file +N/-M counts provided',
+    )
+    expect(detailedBody.messages[1].content).toContain('Per-file additions/deletions')
+    expect(detailedBody.messages[1].content).toContain('src/cache.ts: +100 additions, -10 deletions')
+    expect(briefBody.messages[1].content).not.toContain('Per-file additions/deletions')
+  })
+
+  it('buildDeltaSection detailed branches the system prompt; brief stays intent-level', async () => {
+    const { calls: detailedCalls, chat: detailedChat } = recordChat(() =>
+      JSON.stringify({ title: 't', sentences: ['S.'] }),
+    )
+    await buildDeltaSection(config, makePr(), DELTA_COMMITS, 'prev', {
+      chat: detailedChat,
+      detail: 'detailed',
+    })
+    expect(detailedCalls[0]!.messages[0]!.text).toContain(
+      'state removals and additions as separate statements',
+    )
+    expect(detailedCalls[0]!.messages[0]!.text).toContain('"files": string[]')
+
+    const { calls: briefCalls, chat: briefChat } = recordChat(() =>
+      JSON.stringify({ title: 't', sentences: ['S.'] }),
+    )
+    await buildDeltaSection(config, makePr(), DELTA_COMMITS, 'prev', { chat: briefChat })
+    expect(briefCalls[0]!.messages[0]!.text).not.toContain('state removals and additions')
+    expect(briefCalls[0]!.messages[0]!.text).toContain('"files": string[]')
+  })
+})

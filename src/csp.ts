@@ -5,6 +5,13 @@
 // user-entered endpoint only works when its origin is already allowed by
 // the served CSP. These helpers extract connect-src from the meta tag and
 // decide whether an endpoint origin passes it.
+//
+// The service-worker LLM proxy (src/llmproxy.ts + public/sw.js) bypasses
+// connect-src for custom endpoints once it controls the page: proxy calls
+// are same-origin, and the SW forwards them outside the page CSP. Use
+// endpointUsable() for the combined verdict.
+
+import { isProxyActive, validateProxyTarget } from './llmproxy'
 
 /** Extract a named directive's value from a full CSP string. */
 function directiveValue(csp: string, name: string): string | null {
@@ -99,4 +106,63 @@ export function endpointAllowedByConnectSrc(
     if (hostMatches(token, url)) return true
   }
   return false
+}
+
+/**
+ * True when the service-worker LLM proxy covers custom endpoints: the SW
+ * controls the page, so calls can be rewritten to same-origin proxy
+ * requests that connect-src cannot block. False on first load (SW not yet
+ * controlling) and wherever service workers are unavailable — callers then
+ * need the endpoint to pass connect-src directly.
+ */
+export function cspBypassViaProxy(): boolean {
+  return isProxyActive()
+}
+
+/** Options for endpointUsable(). */
+export interface EndpointUsableOptions {
+  /**
+   * connect-src token list. When omitted, read from the page's CSP meta
+   * tag (same lookup src/app.ts does). Pass explicitly outside a browser.
+   */
+  connectSrc?: string | null
+  /** Page origin, used for 'self' matching. Defaults to location.origin. */
+  selfOrigin?: string
+  /** True when the service-worker LLM proxy is active. */
+  proxyActive?: boolean
+}
+
+/** Read connect-src from the page's CSP meta tag; null when there is none. */
+function pageConnectSrc(): string | null {
+  if (typeof document === 'undefined') return null
+  const meta = document.querySelector<HTMLMetaElement>(
+    'meta[http-equiv="Content-Security-Policy"]',
+  )
+  return connectSrcValue(meta?.getAttribute('content') ?? '')
+}
+
+/**
+ * Combined endpoint verdict the app should gate on: true when the endpoint
+ * is allowed by connect-src for direct calls OR the SW proxy is active
+ * (the proxy covers custom endpoints). With the proxy active the endpoint
+ * must still pass the proxy's own target rules — https only, never the
+ * app's own origin — or every call would die on the SW's opaque 502
+ * ("target must be https" / "refusing to proxy to own origin") after
+ * burning the retry budget. Empty endpoints are always usable.
+ */
+export function endpointUsable(endpoint: string, options: EndpointUsableOptions = {}): boolean {
+  if (options.proxyActive === true) {
+    if (endpoint.trim() === '') return true
+    const proxySelfOrigin =
+      options.selfOrigin ?? (typeof location !== 'undefined' ? location.origin : '')
+    return validateProxyTarget(endpoint.trim(), proxySelfOrigin).ok
+  }
+  if (endpoint.trim() === '') return true
+  const connectSrc =
+    options.connectSrc !== undefined ? options.connectSrc : pageConnectSrc()
+  // No connect-src directive -> nothing is blocked directly.
+  if (connectSrc === null || connectSrc === '') return true
+  const selfOrigin =
+    options.selfOrigin ?? (typeof location !== 'undefined' ? location.origin : '')
+  return endpointAllowedByConnectSrc(endpoint, connectSrc, selfOrigin)
 }

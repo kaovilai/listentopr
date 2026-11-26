@@ -1,14 +1,24 @@
 // ListenToPR app shell. Plain DOM, CSP-safe: no inline scripts, no inline
 // style attributes; all styling comes from styles.css classes.
 // contract says class KeyVault; sibling currently exports it as Vault
-import { Vault as KeyVault, VaultError, isPrfSupported } from './vault'
+import { Vault as KeyVault, isPrfSupported } from './vault'
 import {
   parsePrInput,
   findPrUrl,
+  parseGitTarget,
+  pseudoTargetRef,
+  PSEUDO_REF_FLOOR,
   fetchPullRequest,
   fetchNewCommits,
   fetchImageAsDataUrl,
+  fetchFileContent,
+  fetchCommit,
+  fetchCompare,
+  type GitFileTarget,
 } from './github'
+import { parsePastedContent } from './paste'
+import { withRetry, retryableHttpError, actionableLlmError } from './retry'
+import { llmProxyFetch, isProxyActive, validateProxyTarget } from './llmproxy'
 import {
   createTranscriptStream,
   sanitizeLine,
@@ -19,7 +29,7 @@ import { chat } from './llm'
 import { createTtsController, listVoices } from './tts'
 import { createWakeLockController, shouldShowWakeLockFallback } from './wakelock'
 import { createUpdateController, type UpdateController } from './update'
-import { connectSrcValue, endpointAllowedByConnectSrc } from './csp'
+import { connectSrcValue, endpointAllowedByConnectSrc, endpointUsable } from './csp'
 import { createStore } from './store'
 import { createMediaSessionController, type MediaSessionController } from './mediasession'
 import { createKeyboardController, type KeyboardController } from './keyboard'
@@ -44,6 +54,7 @@ import type {
   SecretId,
   Transcript,
   TranscriptBudget,
+  TranscriptDetail,
   TranscriptSection,
   TtsState,
 } from './types'
@@ -86,6 +97,7 @@ const KEYS = {
   model: 'listentopr.llm-model',
   visionModel: 'listentopr.llm-vision-model',
   context: 'listentopr.llm-context',
+  detail: 'listentopr.detail',
   prefs: 'listentopr.tts-prefs',
   wlDismissed: 'listentopr.wl-banner-dismissed',
 } as const
@@ -181,6 +193,15 @@ updateBanner.setAttribute('aria-live', 'polite')
 }
 let updateCtrl: UpdateController | null = null
 
+const hiddenBanner = el(
+  'div',
+  'banner banner-warn',
+  'Playback pauses when this tab is hidden — keep it open',
+)
+hiddenBanner.hidden = true
+hiddenBanner.setAttribute('role', 'status')
+hiddenBanner.setAttribute('aria-live', 'polite')
+
 // main-view element refs (reassigned on each render)
 let listenBtn: HTMLButtonElement | null = null
 let loadingEl: HTMLElement | null = null
@@ -208,6 +229,15 @@ let sleepTickId: number | null = null
 let currentRef: PullRequestRef | null = null
 let currentHeadSha: string | null = null
 let currentTitle = ''
+/**
+ * True while the vault is the session-only ephemeral one (first run before
+ * the user opts into "Remember for next time").
+ */
+let vaultEphemeral = false
+/** File target behind the current load, for blob file-chip links. */
+let currentFileTarget: GitFileTarget | null = null
+/** One-time-per-session hint that a custom endpoint goes via the SW proxy. */
+let proxyHintShown = false
 /** True between "playback started" and natural stop/finish. */
 let playbackActive = false
 /** Timestamp of the last throttled resume-position write. */
@@ -331,6 +361,224 @@ export function transcriptToText(title: string, sections: TranscriptSection[]): 
   return parts.join('\n').trim() + '\n'
 }
 
+// ---------- input routing (url vs paste vs garbage) ----------
+
+export type InputRoute =
+  | { kind: 'pr'; ref: PullRequestRef }
+  | { kind: 'file'; file: GitFileTarget }
+  | { kind: 'commit'; commit: { owner: string; repo: string; sha: string } }
+  | { kind: 'compare'; compare: { owner: string; repo: string; base: string; head: string } }
+  | { kind: 'paste'; text: string }
+  | { kind: 'error'; message: string }
+
+/**
+ * Decide how the input box content should be loaded: any GitHub target
+ * (PR, blob/raw file, commit, compare) goes through its fetcher; multiline
+ * or long free text is offered to the paste parser; anything else is a
+ * clear error. Single-line short garbage never reaches the paste parser.
+ */
+export function routeInput(input: string): InputRoute {
+  const trimmed = input.trim()
+  const target = parseGitTarget(trimmed)
+  if (target !== null) {
+    if (target.kind === 'pr') return { kind: 'pr', ref: target.ref }
+    if (target.kind === 'file') return { kind: 'file', file: target.file }
+    if (target.kind === 'commit') return { kind: 'commit', commit: target.commit }
+    return { kind: 'compare', compare: target.compare }
+  }
+  if (trimmed.includes('\n') || trimmed.length >= 80) {
+    return { kind: 'paste', text: trimmed }
+  }
+  return {
+    kind: 'error',
+    message:
+      'Enter a GitHub pull request, file, commit or compare URL — or paste PR text (description and diff).',
+  }
+}
+
+// ---------- detail setting ----------
+
+/** Parse the persisted detail setting ('listentopr.detail'); 'brief' unless exactly 'detailed'. */
+export function parseDetailSetting(raw: string | null): TranscriptDetail {
+  return raw === 'detailed' ? 'detailed' : 'brief'
+}
+
+function readDetail(): TranscriptDetail {
+  return parseDetailSetting(lsGet(KEYS.detail))
+}
+
+// ---------- big-PR honesty ----------
+
+/**
+ * Status note when generated files were filtered out of a PR fetch:
+ * "Showing N of M changed files (lockfiles/generated skipped)". Null when
+ * nothing was skipped or the source does not report a raw count.
+ */
+export function bigPrStatus(pr: PullRequestData): string | null {
+  if (pr.rawChangedFiles === undefined) return null
+  if (pr.rawChangedFiles <= pr.changedFiles) return null
+  return `Showing ${pr.changedFiles} of ${pr.rawChangedFiles} changed files (lockfiles/generated skipped)`
+}
+
+// ---------- file chips ----------
+
+/**
+ * Link target for a section's file chip: the PR's Files tab for real PRs,
+ * the blob URL for file-target loads, nothing otherwise (pasted text and
+ * commit/compare pseudo-PRs have no per-file GitHub home worth linking).
+ * Pseudo-PR refs carry numbers at or above PSEUDO_REF_FLOOR and never link
+ * to a PR page.
+ */
+export function fileChipHref(
+  ref: PullRequestRef | null,
+  fileTarget: GitFileTarget | null,
+  path: string,
+): string | null {
+  if (fileTarget !== null) {
+    const encoded = path
+      .split('/')
+      .map((segment) => encodeURIComponent(segment))
+      .join('/')
+    return `https://github.com/${fileTarget.owner}/${fileTarget.repo}/blob/${encodeURIComponent(fileTarget.ref)}/${encoded}`
+  }
+  if (ref !== null && ref.number > 0 && ref.number < PSEUDO_REF_FLOOR) {
+    return `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}/files`
+  }
+  return null
+}
+
+// ---------- LLM retry status ----------
+
+/** Status line while an LLM call backs off: "Retrying in 2s…". */
+export function retryStatusMessage(delayMs: number): string {
+  const seconds = Math.max(1, Math.round(delayMs / 1000))
+  return `Retrying in ${seconds}s…`
+}
+
+/**
+ * The chat call every load uses: wrapped in withRetry (retryable HTTP
+ * errors only), routed through the service-worker proxy fetch when one
+ * controls the page, and surfacing an actionable message when the final
+ * attempt fails. `observe` sees each call's messages (single-shot tracking).
+ */
+function makeChatFn(observe?: (messages: LlmMessage[]) => void): typeof chat {
+  const proxyFetch = llmProxyFetch()
+  const routedFetch = (url: string, init?: RequestInit): Promise<Response> =>
+    proxyFetch(url, init ?? {})
+  let retried = false
+  return (config, messages, opts) => {
+    observe?.(messages)
+    return withRetry(
+      () => chat(config, messages, { ...opts, fetch: routedFetch }),
+      {
+        retryOn: retryableHttpError,
+        onRetry: (_attempt, delayMs) => {
+          retried = true
+          setStatus(retryStatusMessage(delayMs), 'info')
+        },
+      },
+    ).then(
+      (text) => {
+        if (retried) setStatus('Connection recovered — continuing.', 'info')
+        return text
+      },
+      (err) => {
+        setStatus(actionableLlmError(err))
+        throw err
+      },
+    )
+  }
+}
+
+// ---------- demo transcript (Try a sample) ----------
+
+/**
+ * Bookmarklet shipped in the main view: on any GitHub PR page it hops to
+ * ListenToPR with the PR URL preloaded (the ?pr= share-target route).
+ */
+export const BOOKMARKLET_HREF =
+  "javascript:location.href='https://github.tig.pw/listentopr/?pr='+encodeURIComponent(location.href)"
+
+/**
+ * Copy the bookmarklet URL to the clipboard; returns the status line for
+ * the chip click. The page's own CSP (script-src 'self') blocks
+ * javascript: navigation, so clicking the chip on the app page can never
+ * run the bookmarklet — copying it (or dragging the chip to the bookmarks
+ * bar, which the href still serves) is the only working interaction.
+ * Exported for tests.
+ */
+export async function copyBookmarklet(): Promise<string> {
+  try {
+    await navigator.clipboard.writeText(BOOKMARKLET_HREF)
+    return 'Bookmarklet copied — paste it as a new bookmark, then click it on any GitHub pull request page.'
+  } catch {
+    return 'Cannot copy the bookmarklet here — drag the chip to your bookmarks bar instead.'
+  }
+}
+
+export const DEMO_REF: PullRequestRef = { owner: 'demo', repo: 'sample', number: 0 }
+
+/** Mermaid blocks shipped with the demo, so diagrams render offline. */
+export const DEMO_MERMAID_BLOCKS: readonly string[] = [
+  'flowchart TD\n' +
+    '  Load[Load pull request] --> Cache{Cache hit?}\n' +
+    '  Cache -- yes --> Play[Play transcript]\n' +
+    '  Cache -- no --> Gen[Generate sections]\n' +
+    '  Gen --> Stream[Stream to speech]\n' +
+    '  Stream --> Play',
+]
+
+/**
+ * Bundled sample transcript: a fictional PR narrated in four sections, no
+ * network or keys needed. Instant TTS on a fresh install.
+ */
+export const DEMO_TRANSCRIPT: Transcript = {
+  title: 'Add retry engine and streaming sections to the summarizer',
+  sections: [
+    {
+      id: 'overview',
+      title: 'Overview',
+      sentences: [
+        'This pull request makes the transcript generator resilient and fast to start.',
+        'A new retry engine wraps every model call with exponential backoff and jitter.',
+        'Sections now stream out as they are generated, so speech starts after the first one instead of waiting for the whole transcript.',
+        'Nothing changes for callers that ignore the new options.',
+      ],
+    },
+    {
+      id: 'architecture',
+      title: 'Architecture',
+      sentences: [
+        'The loader first checks the local cache keyed by the head commit.',
+        'On a miss, sections are generated one batch at a time and appended to the speech queue.',
+        'A prefetch window keeps generation ahead of playback by about four sentences.',
+        'The whole flow looks like this.',
+      ],
+      files: ['src/transcript.ts'],
+    },
+    {
+      id: 'changes',
+      title: 'Changes',
+      sentences: [
+        'The retry helper lives in its own module with an injectable sleep for tests.',
+        'It retries timeout, rate limit, and server error statuses, and gives up on anything else.',
+        'The stream factory now accepts a detail level for brief or per-file narration.',
+        'Lockfiles and generated files are filtered before batching, so narration stays on real code.',
+      ],
+      files: ['src/retry.ts', 'src/transcript.ts', 'src/github.ts'],
+    },
+    {
+      id: 'review-notes',
+      title: 'Review notes',
+      sentences: [
+        'Reviewers asked for a cap on backoff, which landed at fifteen seconds.',
+        'The queue holds playback while the next section generates, and resumes without repeating a sentence.',
+        'All new behavior is covered by unit tests with the network mocked.',
+      ],
+    },
+  ],
+}
+
 // ---------- context-budget settings ----------
 
 /**
@@ -416,6 +664,12 @@ function llmEndpointAllowed(endpoint: string): boolean {
 const CSP_ENDPOINT_MSG =
   'LLM endpoint is not allowed by this build\'s Content-Security-Policy. ' +
   'Rebuild with VITE_LLM_ENDPOINT set to that origin, or use an allowed endpoint.'
+
+/** The SW proxy rejects non-https targets and its own origin with an opaque
+ * 502; surface the real cause at save time instead. */
+const PROXY_TARGET_MSG =
+  'The service-worker proxy only forwards https endpoints on other origins. ' +
+  'Use an https endpoint outside this site.'
 
 // ---------- theme ----------
 
@@ -509,6 +763,7 @@ function resetRoot(): void {
   root.textContent = ''
   root.appendChild(offlineBanner)
   root.appendChild(updateBanner)
+  root.appendChild(hiddenBanner)
   statusEl = null
 }
 
@@ -521,95 +776,74 @@ function makeStatusEl(): HTMLElement {
   return s
 }
 
-// ---------- setup view (first run) ----------
-
-function showSetup(): void {
-  resetRoot()
-  if (!root) return
-  const card = el('div', 'card')
-  card.appendChild(el('h1', 'app-title', 'ListenToPR'))
-  card.appendChild(
-    el('p', 'muted', 'Create a PIN to encrypt your keys on this device.'),
-  )
-
-  const pin = labeledInput('PIN (at least 4 characters)', 'password')
-  const confirmPin = labeledInput('Confirm PIN', 'password')
-  const btn = el('button', 'btn btn-primary', 'Create vault')
-  btn.type = 'button'
-
-  async function submit(): Promise<void> {
-    const p = pin.input.value
-    const c = confirmPin.input.value
-    if (p.length < 4) {
-      setStatus('PIN must be at least 4 characters.')
-      return
-    }
-    if (p !== c) {
-      setStatus('PINs do not match.')
-      return
-    }
-    btn.disabled = true
-    try {
-      await vault.setupWithPin(p)
-      lsSet(KEYS.vaultReady, '1')
-      pin.input.value = ''
-      confirmPin.input.value = ''
-      showMain()
-    } catch (err) {
-      // IndexedDB outlives the vault-ready flag; if records already exist,
-      // route to the unlock screen instead of bricking the vault.
-      if (err instanceof VaultError && err.code === 'VAULT_ALREADY_SET_UP') {
-        lsSet(KEYS.vaultReady, '1')
-        showLocked()
-        return
-      }
-      setStatus(sanitizeError(err))
-      btn.disabled = false
-    }
-  }
-
-  btn.addEventListener('click', () => {
-    void submit()
-  })
-  pin.input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') void submit()
-  })
-  confirmPin.input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') void submit()
-  })
-
-  card.appendChild(pin.wrap)
-  card.appendChild(confirmPin.wrap)
-  card.appendChild(btn)
-  card.appendChild(makeStatusEl())
-  root.appendChild(card)
-}
-
 // ---------- locked view ----------
+// First run has no gate: the vault starts ephemeral and the main view shows
+// immediately (see init). Only a persistent vault with saved records locks.
 
 /**
- * Dead-end recovery for unlock failures. The vault-ready localStorage flag
+ * Status for a PRF-only vault reached through the PIN path. When this
+ * screen offers no biometric unlock at all (no WebAuthn PRF in this
+ * browser, or the credential lives on another device), pointing at the
+ * biometric unlock would be a dead end — the locked view carries a
+ * "Wipe vault and start fresh" escape hatch for exactly that case.
+ * Exported for tests.
+ */
+export function pinOnlyVaultMessage(prfSupported: boolean): string {
+  return prfSupported
+    ? 'This vault was set up with biometrics only — use the biometric unlock.'
+    : 'This vault was set up with biometrics only, and biometric unlock is unavailable here (different browser, device, or credentials). Use "Wipe vault and start fresh" below to reset.'
+}
+
+/**
+ * Dead-end recovery for unlock failures. The localStorage vault-ready flag
  * and the IndexedDB records can disagree (wipe that failed halfway, a
  * biometric bootstrap that never persisted a secret, stale cached shell
- * from an older deploy). Detect the mismatch and route to setup instead
- * of stranding the user on the locked screen. Returns true when handled.
+ * from an older deploy). Detect the mismatch and drop back to a fresh
+ * ephemeral session instead of stranding the user on the locked screen.
+ * Returns true when handled.
  */
 function handleUnlockDeadEnd(err: string): boolean {
   if (/not set up/i.test(err)) {
     lsRemove(KEYS.vaultReady)
-    // showSetup() re-renders (and replaces the status element), so the
-    // message must be set after it, not before.
-    showSetup()
-    setStatus('Vault has no saved keys — creating a fresh one.')
+    startEphemeralSession()
+    setStatus('Vault has no saved keys — starting a fresh session.')
     return true
   }
   if (/not protected with a PIN/i.test(err)) {
-    setStatus(
-      'This vault was set up with biometrics only — use the biometric unlock.',
-    )
+    setStatus(pinOnlyVaultMessage(vaultPrfSupported()))
     return true
   }
   return false
+}
+
+/**
+ * Destructive reset shared by the Settings "Wipe All Keys" button and the
+ * locked view's escape hatch: wipe the vault, drop the settings keys, and
+ * drop into a fresh ephemeral session. The non-secret store (transcripts,
+ * queue, history) is deliberately NOT wiped here: it holds no key material.
+ */
+async function wipeVaultAndStartFresh(): Promise<void> {
+  await vault.wipeAll()
+  lsRemove(KEYS.vaultReady)
+  lsRemove(KEYS.provider)
+  lsRemove(KEYS.endpoint)
+  lsRemove(KEYS.model)
+  lsRemove(KEYS.visionModel)
+  lsRemove(KEYS.context)
+  lsRemove(KEYS.detail)
+  lsRemove(KEYS.prefs)
+  // Fresh session: no gate, ephemeral vault, main view.
+  startEphemeralSession()
+}
+
+/** Swap in a fresh ephemeral vault (no gate, session-only secrets) and show the main view. */
+function startEphemeralSession(): void {
+  vault = new KeyVault({ mode: 'ephemeral' })
+  vaultEphemeral = true
+  vault.onLock(() => {
+    showLocked()
+  })
+  showMain()
 }
 
 function showLocked(): void {
@@ -625,7 +859,54 @@ function showLocked(): void {
   }
   const card = el('div', 'card')
   card.appendChild(el('h1', 'app-title', 'ListenToPR'))
+
+  if (vaultEphemeral) {
+    // An ephemeral vault has no re-unlock path: lock() dropped its in-memory
+    // secrets. A reload starts a fresh session.
+    card.appendChild(
+      el(
+        'p',
+        'muted',
+        'Session vault locked — secrets saved for this session were dropped. Reload to start fresh.',
+      ),
+    )
+    const reload = el('button', 'btn btn-primary', 'Reload')
+    reload.type = 'button'
+    reload.addEventListener('click', () => {
+      try {
+        window.location.reload()
+      } catch {
+        // ignore — reload unavailable (tests)
+      }
+    })
+    card.appendChild(reload)
+    card.appendChild(makeStatusEl())
+    root.appendChild(card)
+    return
+  }
+
   card.appendChild(el('p', 'muted', 'Vault locked. Enter your PIN to continue.'))
+
+  // Biometric unlock comes first when the environment supports PRF.
+  if (vaultPrfSupported()) {
+    const bio = el('button', 'btn btn-secondary', 'Unlock with biometrics')
+    bio.type = 'button'
+    bio.addEventListener('click', () => {
+      void (async () => {
+        bio.disabled = true
+        const { ok, err } = await vaultUnlockPrf()
+        if (ok) {
+          showMain()
+        } else if (err !== undefined && handleUnlockDeadEnd(err)) {
+          return
+        } else {
+          setStatus(err ?? 'Biometric unlock failed. Use your PIN.')
+          bio.disabled = false
+        }
+      })()
+    })
+    card.appendChild(bio)
+  }
 
   const pin = labeledInput('PIN', 'password')
   const btn = el('button', 'btn btn-primary', 'Unlock')
@@ -654,31 +935,60 @@ function showLocked(): void {
   card.appendChild(pin.wrap)
   card.appendChild(btn)
 
-  if (vaultPrfSupported()) {
-    const bio = el('button', 'btn btn-secondary', 'Unlock with biometrics')
-    bio.type = 'button'
-    bio.addEventListener('click', () => {
-      void (async () => {
-        bio.disabled = true
-        const { ok, err } = await vaultUnlockPrf()
-        if (ok) {
-          showMain()
-        } else if (err !== undefined && handleUnlockDeadEnd(err)) {
-          return
-        } else {
-          setStatus(err ?? 'Biometric unlock failed. Use your PIN.')
-          bio.disabled = false
-        }
-      })()
-    })
-    card.appendChild(bio)
-  }
+  // Escape hatch: a PRF-only vault opened where that credential does not
+  // exist (different browser or device, no WebAuthn PRF at all) has no
+  // working unlock on this screen. Offer the destructive reset here
+  // instead of a permanent lockout.
+  const wipeBtn = el('button', 'btn btn-danger', 'Wipe vault and start fresh')
+  wipeBtn.type = 'button'
+  wipeBtn.addEventListener('click', () => {
+    if (!window.confirm('Wipe all stored keys? This cannot be undone.')) return
+    void (async () => {
+      wipeBtn.disabled = true
+      try {
+        await wipeVaultAndStartFresh()
+      } catch (err) {
+        setStatus(sanitizeError(err))
+        wipeBtn.disabled = false
+      }
+    })()
+  })
+  card.appendChild(wipeBtn)
 
   card.appendChild(makeStatusEl())
   root.appendChild(card)
 }
 
 // ---------- settings panel ----------
+
+/** Current voiceschanged handler for the settings voice preview, so a re-render replaces the previous one. */
+let voicePreviewHandler: (() => void) | null = null
+
+/** Speak "This is how I sound." with a voice, at the current rate and pitch. */
+function speakVoicePreview(voiceName: string): void {
+  try {
+    const w = window as unknown as {
+      speechSynthesis?: { cancel(): void; speak(u: unknown): void }
+      SpeechSynthesisUtterance?: new (text: string) => {
+        voice?: unknown
+        rate?: number
+        pitch?: number
+      }
+    }
+    const Ctor = w.SpeechSynthesisUtterance
+    if (!w.speechSynthesis || !Ctor) return
+    const utter = new Ctor('This is how I sound.')
+    const voice = listVoices().find((v) => v.name === voiceName)
+    if (voice) utter.voice = voice
+    const prefs = tts.getPrefs()
+    utter.rate = prefs.rate
+    utter.pitch = prefs.pitch
+    w.speechSynthesis.cancel()
+    w.speechSynthesis.speak(utter)
+  } catch {
+    // preview is best-effort
+  }
+}
 
 function buildSettingsPanel(): HTMLDivElement {
   const panel = el('div', 'settings-panel')
@@ -736,6 +1046,158 @@ function buildSettingsPanel(): HTMLDivElement {
   singleLabel.appendChild(singleShotBox)
   singleWrap.appendChild(singleLabel)
 
+  // Detail toggle: brief (intent-level) vs detailed (per-file +/-) narration.
+  const detailWrap = el('div', 'field')
+  const detailLabel = el('label', 'field-label', 'Detailed change narration')
+  const detailBox = el('input')
+  detailBox.type = 'checkbox'
+  detailBox.checked = readDetail() === 'detailed'
+  detailLabel.appendChild(detailBox)
+  detailWrap.appendChild(detailLabel)
+
+  const autoLock = el(
+    'p',
+    'muted autolock-indicator',
+    'Vault unlocked — it locks automatically after idle.',
+  )
+  const syncAutoLockText = (): void => {
+    autoLock.textContent = vaultEphemeral
+      ? 'Session vault — secrets stay in memory and drop when this tab closes.'
+      : 'Vault unlocked — it locks automatically after idle.'
+  }
+  syncAutoLockText()
+
+  // "Remember for next time": migrate the ephemeral vault to a persistent
+  // one. PRF (biometric prompt) first when supported, else PIN twice-entry.
+  const rememberWrap = el('div', 'remember-wrap')
+  if (vaultEphemeral) {
+    rememberWrap.appendChild(
+      el(
+        'p',
+        'muted',
+        'Secrets are saved for this session only. Remember them for next time?',
+      ),
+    )
+    const rememberDone = (): void => {
+      vaultEphemeral = false
+      rememberWrap.hidden = true
+      syncAutoLockText()
+    }
+    const pinForm = el('div', 'field-group')
+    pinForm.hidden = true
+    const pin1 = labeledInput('New PIN (at least 4 characters)', 'password')
+    const pin2 = labeledInput('Confirm PIN', 'password')
+    const pinSave = el('button', 'btn btn-primary', 'Save on this device')
+    pinSave.type = 'button'
+    const submitPin = (): void => {
+      void (async () => {
+        const p = pin1.input.value
+        if (p.length < 4) {
+          setStatus('PIN must be at least 4 characters.')
+          return
+        }
+        if (p !== pin2.input.value) {
+          setStatus('PINs do not match.')
+          return
+        }
+        pinSave.disabled = true
+        try {
+          await vault.persistToPin(p)
+          lsSet(KEYS.vaultReady, '1')
+          pin1.input.value = ''
+          pin2.input.value = ''
+          rememberDone()
+          setStatus('Saved on this device — next launch asks for your PIN.', 'info')
+        } catch (err) {
+          setStatus(sanitizeError(err))
+          pinSave.disabled = false
+        }
+      })()
+    }
+    pinSave.addEventListener('click', submitPin)
+    pin2.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitPin()
+    })
+    pinForm.appendChild(pin1.wrap)
+    pinForm.appendChild(pin2.wrap)
+    pinForm.appendChild(pinSave)
+
+    if (vaultPrfSupported()) {
+      const bio = el('button', 'btn btn-secondary', 'Remember with biometrics')
+      bio.type = 'button'
+      bio.addEventListener('click', () => {
+        void (async () => {
+          bio.disabled = true
+          try {
+            await vault.persistToPrf() // may prompt biometrics once
+            lsSet(KEYS.vaultReady, '1')
+            rememberDone()
+            setStatus(
+              'Saved on this device — next launch unlocks with biometrics.',
+              'info',
+            )
+          } catch (err) {
+            setStatus(sanitizeError(err))
+            bio.disabled = false
+          }
+        })()
+      })
+      rememberWrap.appendChild(bio)
+      const usePin = el('button', 'btn btn-small', 'Use a PIN instead')
+      usePin.type = 'button'
+      usePin.addEventListener('click', () => {
+        pinForm.hidden = false
+        usePin.hidden = true
+      })
+      rememberWrap.appendChild(usePin)
+    } else {
+      pinForm.hidden = false
+    }
+    rememberWrap.appendChild(pinForm)
+  }
+
+  // Voice preview: a play button per available system voice.
+  const voicePreview = el('details', 'voice-preview')
+  voicePreview.appendChild(el('summary', undefined, 'Voice preview'))
+  const voicePreviewList = el('div', 'voice-preview-list')
+  voicePreview.appendChild(voicePreviewList)
+  const fillVoicePreview = (): void => {
+    voicePreviewList.textContent = ''
+    const voices = listVoices()
+    if (voices.length === 0) {
+      voicePreviewList.appendChild(
+        el('p', 'muted', 'No voices yet — they load asynchronously in this browser.'),
+      )
+      return
+    }
+    for (const v of voices) {
+      const row = el('div', 'voice-preview-row')
+      row.appendChild(el('span', 'voice-preview-name', `${v.name} (${v.lang ?? ''})`))
+      const play = el('button', 'btn btn-small', 'Play')
+      play.type = 'button'
+      play.setAttribute('aria-label', `Preview voice ${v.name}`)
+      play.addEventListener('click', () => speakVoicePreview(v.name))
+      row.appendChild(play)
+      voicePreviewList.appendChild(row)
+    }
+  }
+  fillVoicePreview()
+  {
+    const synth = (
+      window as unknown as {
+        speechSynthesis?: {
+          addEventListener?: (type: string, cb: () => void) => void
+          removeEventListener?: (type: string, cb: () => void) => void
+        }
+      }
+    ).speechSynthesis
+    if (voicePreviewHandler && synth?.removeEventListener) {
+      synth.removeEventListener('voiceschanged', voicePreviewHandler)
+    }
+    voicePreviewHandler = fillVoicePreview
+    synth?.addEventListener?.('voiceschanged', voicePreviewHandler)
+  }
+
   const save = el('button', 'btn btn-primary', 'Save settings')
   save.type = 'button'
   save.addEventListener('click', () => {
@@ -743,9 +1205,25 @@ function buildSettingsPanel(): HTMLDivElement {
       save.disabled = true
       try {
         const epVal = endpoint.input.value.trim()
-        if (epVal !== '' && !llmEndpointAllowed(epVal)) {
-          setStatus(CSP_ENDPOINT_MSG)
-          return
+        let viaProxyHint = false
+        if (epVal !== '') {
+          const proxyActive = isProxyActive()
+          if (!endpointUsable(epVal, { proxyActive })) {
+            // With the proxy active the rejection is the SW's own target
+            // rule (https-only, never this origin), not connect-src.
+            setStatus(
+              proxyActive && !validateProxyTarget(epVal, window.location.origin).ok
+                ? PROXY_TARGET_MSG
+                : CSP_ENDPOINT_MSG,
+            )
+            return
+          }
+          // The SW proxy is what makes a CSP-disallowed endpoint work: say
+          // so once instead of the old hard block.
+          if (proxyActive && !llmEndpointAllowed(epVal) && !proxyHintShown) {
+            proxyHintShown = true
+            viaProxyHint = true
+          }
         }
         const patVal = pat.input.value.trim()
         if (patVal) {
@@ -781,7 +1259,15 @@ function buildSettingsPanel(): HTMLDivElement {
           ...(perCallVal !== null ? { maxContextPerCall: perCallVal } : {}),
           singleShot: singleShotBox.checked,
         })
-        setStatus('Settings saved.', 'info')
+        lsSet(KEYS.detail, detailBox.checked ? 'detailed' : 'brief')
+        setStatus(
+          viaProxyHint
+            ? 'Settings saved — custom endpoint routed via service worker.'
+            : vaultEphemeral
+              ? 'Saved for this session'
+              : 'Settings saved.',
+          'info',
+        )
       } catch (err) {
         setStatus(sanitizeError(err))
       } finally {
@@ -797,22 +1283,11 @@ function buildSettingsPanel(): HTMLDivElement {
     void (async () => {
       wipe.disabled = true
       try {
-        await vault.wipeAll()
+        await wipeVaultAndStartFresh()
       } catch (err) {
         setStatus(sanitizeError(err))
         wipe.disabled = false
-        return
       }
-      // The non-secret store (transcripts, queue, history) is deliberately
-      // NOT wiped here: it holds no key material.
-      lsRemove(KEYS.vaultReady)
-      lsRemove(KEYS.provider)
-      lsRemove(KEYS.endpoint)
-      lsRemove(KEYS.model)
-      lsRemove(KEYS.visionModel)
-      lsRemove(KEYS.context)
-      lsRemove(KEYS.prefs)
-      showSetup()
     })()
   })
 
@@ -822,6 +1297,7 @@ function buildSettingsPanel(): HTMLDivElement {
   panel.appendChild(model.wrap)
   panel.appendChild(visionModel.wrap)
   panel.appendChild(apiKey.wrap)
+  panel.appendChild(rememberWrap)
   panel.appendChild(el('h3', 'panel-advanced-title', 'Advanced'))
   panel.appendChild(
     el('p', 'muted', 'Context budget for transcript generation; empty fields use the defaults.'),
@@ -829,13 +1305,10 @@ function buildSettingsPanel(): HTMLDivElement {
   panel.appendChild(contextWindow.wrap)
   panel.appendChild(maxPerCall.wrap)
   panel.appendChild(singleWrap)
+  panel.appendChild(detailWrap)
   panel.appendChild(save)
+  panel.appendChild(voicePreview)
 
-  const autoLock = el(
-    'p',
-    'muted autolock-indicator',
-    'Vault unlocked — it locks automatically after idle.',
-  )
   panel.appendChild(autoLock)
   panel.appendChild(wipe)
   return panel
@@ -1241,6 +1714,27 @@ function appendSectionToView(section: TranscriptSection): void {
     wrap.appendChild(document.createTextNode(' '))
   })
   sec.appendChild(wrap)
+  // File chips: the files this section narrates, linked to GitHub when the
+  // load has a sensible target (PR files tab / file-target blob).
+  const files = section.files ?? []
+  if (files.length > 0) {
+    const chips = el('div', 'file-chips')
+    for (const path of files) {
+      const href = fileChipHref(currentRef, currentFileTarget, path)
+      let chip: HTMLElement
+      if (href !== null) {
+        const a = el('a', 'file-chip', path)
+        a.href = href
+        a.target = '_blank'
+        a.rel = 'noopener'
+        chip = a
+      } else {
+        chip = el('span', 'file-chip', path)
+      }
+      chips.appendChild(chip)
+    }
+    sec.appendChild(chips)
+  }
   transcriptEl.appendChild(sec)
 }
 
@@ -1480,6 +1974,18 @@ function buildControls(): HTMLDivElement {
   prevSentence.setAttribute('aria-label', 'Previous sentence')
   prevSentence.addEventListener('click', () => tts.skip(-1))
 
+  // Replay: restart the CURRENT sentence (seek to it, keep speaking).
+  const replayBtn = el('button', 'btn btn-icon', '↻')
+  replayBtn.type = 'button'
+  replayBtn.title = 'Replay sentence'
+  replayBtn.setAttribute('aria-label', 'Replay current sentence')
+  replayBtn.addEventListener('click', () => {
+    const st = tts.state()
+    if (!st.playing && !st.paused) return
+    tts.seekTo(flatSentenceCursor(streamSections, st.sectionIndex, st.sentenceIndex))
+    tts.play()
+  })
+
   playBtn = el('button', 'btn btn-primary', 'Play')
   playBtn.type = 'button'
   playBtn.disabled = true
@@ -1596,6 +2102,7 @@ function buildControls(): HTMLDivElement {
 
   controls.appendChild(prevSection)
   controls.appendChild(prevSentence)
+  controls.appendChild(replayBtn)
   controls.appendChild(playBtn)
   controls.appendChild(pauseBtn)
   controls.appendChild(stopBtn)
@@ -1874,14 +2381,37 @@ function showMain(): void {
   queueBtn.addEventListener('click', () => {
     void enqueueFromInput(urlInput.value.trim())
   })
+  // Demo: bundled transcript, no network, no keys — instant TTS.
+  const demoBtn = el('button', 'btn btn-small', 'Try a sample')
+  demoBtn.type = 'button'
+  demoBtn.addEventListener('click', () => {
+    void loadDemo()
+  })
   form.appendChild(urlInput)
   form.appendChild(listenBtn)
   form.appendChild(queueBtn)
+  form.appendChild(demoBtn)
   form.addEventListener('submit', (e) => {
     e.preventDefault()
     void startLoad(urlInput.value.trim())
   })
   main.appendChild(form)
+
+  // Bookmarklet chip: drag to the bookmarks bar, click on any GitHub PR page.
+  const bookmarklet = el('a', 'bookmarklet-chip', 'Click to listen')
+  bookmarklet.href = BOOKMARKLET_HREF
+  bookmarklet.title =
+    'Drag me to your bookmarks bar. On any GitHub pull request page, click the bookmark to listen to it in ListenToPR.'
+  bookmarklet.setAttribute('aria-label', 'Click to listen bookmarklet — drag to your bookmarks bar')
+  bookmarklet.draggable = true
+  // The page CSP (script-src 'self') blocks javascript: navigation, so a
+  // plain click can do nothing here; copy the bookmarklet instead. Dragging
+  // the chip to the bookmarks bar keeps working via the href.
+  bookmarklet.addEventListener('click', (e) => {
+    e.preventDefault()
+    void copyBookmarklet().then((msg) => setStatus(msg, 'info'))
+  })
+  main.appendChild(bookmarklet)
 
   queueListEl = el('div', 'queue-list')
   queueListEl.hidden = true
@@ -1927,12 +2457,27 @@ async function startLoad(url: string): Promise<void> {
     setStatus('Enter a GitHub pull request URL or owner/repo#123.')
     return
   }
-  const ref = parsePrInput(url)
-  if (!ref) {
-    setStatus('Not a valid pull request. Use a GitHub URL or owner/repo#123.')
+  const route = routeInput(url)
+  if (route.kind === 'error') {
+    setStatus(route.message)
     return
   }
-  await startLoadRef(ref)
+  if (route.kind === 'pr') {
+    await startLoadRef(route.ref)
+    return
+  }
+  if (route.kind === 'paste') {
+    const pr = parsePastedContent(route.text)
+    if (pr === null) {
+      setStatus(
+        'Could not find PR content in that text — paste the description plus the diff.',
+      )
+      return
+    }
+    await startLoadPseudo(pr, null)
+    return
+  }
+  await startLoadTarget(route)
 }
 
 /**
@@ -1956,7 +2501,10 @@ async function buildDelta(
     const sinceIso = last ? new Date(last.at).toISOString() : ''
     const commits = await fetchNewCommits(ref, sinceIso, token)
     if (commits.length === 0) return null
-    return await buildDeltaSection(cfg, pr, commits, summarizeTranscript(previous))
+    return await buildDeltaSection(cfg, pr, commits, summarizeTranscript(previous), {
+      detail: readDetail(),
+      chat: makeChatFn(),
+    })
   } catch {
     // Delta is best-effort: fall back to the plain cached transcript.
     return null
@@ -2011,7 +2559,11 @@ async function loadFullTranscript(
   tts.play()
 }
 
-async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<void> {
+/**
+ * Shared load preamble: supersede any in-flight stream (which invalidates
+ * older loads), stop the old speech, and move the app onto a new ref.
+ */
+function beginLoad(ref: PullRequestRef): number {
   clearStatus()
   // New load supersedes any in-flight stream (also invalidates older loads).
   abortActiveStream()
@@ -2027,12 +2579,31 @@ async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<voi
   }
   lastResumeWriteAt = 0
   currentRef = ref
+  currentFileTarget = null
   const myLoad = loadToken
   if (listenBtn) listenBtn.disabled = true
   if (loadingEl) loadingEl.hidden = false
   if (transcriptEl) transcriptEl.hidden = true
   if (actionsEl) actionsEl.hidden = true
   if (controlsEl) controlsEl.hidden = true
+  return myLoad
+}
+
+function endLoad(): void {
+  if (listenBtn) listenBtn.disabled = false
+  if (loadingEl) loadingEl.hidden = true
+}
+
+function handleLoadError(err: unknown): void {
+  if (!window.navigator.onLine || err instanceof TypeError) {
+    showOfflineBanner()
+  } else {
+    setStatus(sanitizeError(err))
+  }
+}
+
+async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<void> {
+  const myLoad = beginLoad(ref)
   try {
     const token = (await vaultGetSecret('github-token')) ?? ''
     // Silent null (locked vault, or secret saved under a different unlock
@@ -2043,133 +2614,224 @@ async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<voi
     }
     const pr = await fetchPullRequest(ref, token)
     if (myLoad !== loadToken) return
-    const title = sanitizeLine(pr.title) || 'Pull request'
-    const headSha = pr.headSha ?? null
-    currentHeadSha = headSha
-    currentTitle = title
-    // Diagram cards for this load; renderStreamTitle builds their container
-    // later, and entries that finish first are parked until then (a newer
-    // load's loadToken still drops the whole result).
-    void renderDiagramCards(pr.mermaidBlocks, myLoad)
+    await loadPulledPr(pr, myLoad, fromQueue)
+  } catch (err) {
+    handleLoadError(err)
+  } finally {
+    endLoad()
+  }
+}
 
-    const endpoint = lsGet(KEYS.endpoint) ?? ''
-    const endpointOk = endpoint === '' || llmEndpointAllowed(endpoint)
-    const visionModel = (lsGet(KEYS.visionModel) ?? '').trim()
-    const cfg: LlmConfig = {
-      provider: readProvider(),
-      endpoint,
-      apiKey: (await vaultGetSecret('llm-api-key')) ?? '',
-      model: lsGet(KEYS.model) ?? '',
-      ...(visionModel !== '' ? { visionModel } : {}),
-    }
+/** file / commit / compare URLs: fetch into pseudo-PR data, then the shared pipeline. */
+async function startLoadTarget(
+  route: Extract<InputRoute, { kind: 'file' | 'commit' | 'compare' }>,
+): Promise<void> {
+  // Key the load under the target's pseudo ref (unique per path/sha/range):
+  // resume positions, listen history and the transcript cache all hang off
+  // it, and the fetched pseudo-PR carries the same ref (pseudoTargetRef is
+  // deterministic), so currentRef and pr.ref agree.
+  const myLoad = beginLoad(pseudoTargetRef(route))
+  currentFileTarget = route.kind === 'file' ? route.file : null
+  try {
+    // Token optional everywhere; empty token = unauthenticated GitHub.
+    const token = (await vaultGetSecret('github-token')) ?? ''
+    const pr =
+      route.kind === 'file'
+        ? await fetchFileContent(route.file, token)
+        : route.kind === 'commit'
+          ? await fetchCommit(route.commit.owner, route.commit.repo, route.commit.sha, token)
+          : await fetchCompare(
+              route.compare.owner,
+              route.compare.repo,
+              route.compare.base,
+              route.compare.head,
+              token,
+            )
     if (myLoad !== loadToken) return
+    await loadPulledPr(pr, myLoad, false)
+  } catch (err) {
+    handleLoadError(err)
+  } finally {
+    endLoad()
+  }
+}
 
-    // ---------- cache hit: instant load, no LLM ----------
-    let cached: Transcript | null = null
+/** Pasted PR text: already-parsed pseudo-PR data, no network. */
+async function startLoadPseudo(
+  pr: PullRequestData,
+  fileTarget: GitFileTarget | null,
+): Promise<void> {
+  const myLoad = beginLoad(pr.ref)
+  currentFileTarget = fileTarget
+  try {
+    await loadPulledPr(pr, myLoad, false)
+  } catch (err) {
+    handleLoadError(err)
+  } finally {
+    endLoad()
+  }
+}
+
+/** Demo mode: bundled transcript, no network, no keys, instant TTS. */
+async function loadDemo(): Promise<void> {
+  const myLoad = beginLoad(DEMO_REF)
+  currentHeadSha = 'demo'
+  currentTitle = DEMO_TRANSCRIPT.title
+  void renderDiagramCards([...DEMO_MERMAID_BLOCKS], myLoad)
+  try {
+    await loadFullTranscript(
+      DEMO_REF,
+      'demo',
+      DEMO_TRANSCRIPT.title,
+      DEMO_TRANSCRIPT.sections,
+      'Demo transcript',
+      true,
+    )
+  } catch (err) {
+    handleLoadError(err)
+  } finally {
+    endLoad()
+  }
+}
+
+/**
+ * Shared pipeline once a PullRequestData is in hand (real PR, file/commit/
+ * compare pseudo-PR, or pasted text): diagrams, cache lookup, streaming.
+ */
+async function loadPulledPr(
+  pr: PullRequestData,
+  myLoad: number,
+  fromQueue: boolean,
+): Promise<void> {
+  const ref = pr.ref
+  const title = sanitizeLine(pr.title) || 'Pull request'
+  const headSha = pr.headSha ?? null
+  currentHeadSha = headSha
+  currentTitle = title
+  // Big-PR honesty: say when lockfiles/generated files were skipped.
+  const fileNote = bigPrStatus(pr)
+  if (fileNote) setStatus(fileNote, 'info')
+  // Diagram cards for this load; renderStreamTitle builds their container
+  // later, and entries that finish first are parked until then (a newer
+  // load's loadToken still drops the whole result).
+  void renderDiagramCards(pr.mermaidBlocks, myLoad)
+
+  const endpoint = lsGet(KEYS.endpoint) ?? ''
+  // Custom endpoints the CSP would block still work when the service-worker
+  // proxy controls the page (endpointUsable folds that in).
+  const endpointOk = endpointUsable(endpoint, { proxyActive: isProxyActive() })
+  const visionModel = (lsGet(KEYS.visionModel) ?? '').trim()
+  const cfg: LlmConfig = {
+    provider: readProvider(),
+    endpoint,
+    apiKey: (await vaultGetSecret('llm-api-key')) ?? '',
+    model: lsGet(KEYS.model) ?? '',
+    ...(visionModel !== '' ? { visionModel } : {}),
+  }
+  if (myLoad !== loadToken) return
+
+  // ---------- cache hit: instant load, no LLM ----------
+  let cached: Transcript | null = null
+  if (store && headSha) {
+    cached = await store.getCachedTranscript(ref, headSha)
+    if (myLoad !== loadToken) return
+  }
+  if (cached !== null) {
+    let sections = cached.sections
+    let deltaApplied = false
     if (store && headSha) {
-      cached = await store.getCachedTranscript(ref, headSha)
+      const latestSha = await store.latestCachedSha(ref)
       if (myLoad !== loadToken) return
-    }
-    if (cached !== null) {
-      let sections = cached.sections
-      let deltaApplied = false
-      if (store && headSha) {
-        const latestSha = await store.latestCachedSha(ref)
+      if (shouldBuildDelta(latestSha, headSha) && latestSha !== null) {
+        const token = (await vaultGetSecret('github-token')) ?? ''
+        const delta = await buildDelta(ref, pr, latestSha, cfg, token, endpointOk)
         if (myLoad !== loadToken) return
-        if (shouldBuildDelta(latestSha, headSha) && latestSha !== null) {
-          const delta = await buildDelta(ref, pr, latestSha, cfg, token, endpointOk)
-          if (myLoad !== loadToken) return
-          if (delta) {
-            sections = [delta, ...sections]
-            deltaApplied = true
-          }
+        if (delta) {
+          sections = [delta, ...sections]
+          deltaApplied = true
         }
       }
-      await loadFullTranscript(
-        ref,
-        headSha,
-        title,
-        sections,
-        fromQueue ? `Up next: ${title}` : 'Loaded from cache',
-        deltaApplied,
-      )
-      return
     }
-
-    // ---------- cache miss: stream as before ----------
-    if (!endpointOk) {
-      // CSP would turn the fetch into a TypeError and show a false
-      // "offline" banner; fail with the real cause instead.
-      setStatus(CSP_ENDPOINT_MSG)
-      return
-    }
-    // images are best-effort: continue on failure
-    const settled = await Promise.allSettled(
-      pr.imageUrls.map((u) => fetchImageAsDataUrl(u, token)),
+    const cacheStatus = fromQueue ? `Up next: ${title}` : 'Loaded from cache'
+    await loadFullTranscript(
+      ref,
+      headSha,
+      title,
+      sections,
+      fileNote !== null ? `${cacheStatus} — ${fileNote}` : cacheStatus,
+      deltaApplied,
     )
-    const imageDataUrls = settled
-      .filter(
-        (r): r is PromiseFulfilledResult<string> => r.status === 'fulfilled',
-      )
-      .map((r) => r.value)
-    if (myLoad !== loadToken) return
-    // Context budget: only passed when the user set at least one knob, so an
-    // untouched install keeps the classic fixed batching. Single-shot can
-    // only fire when opted in; a chat wrapper watches for it so the status
-    // line can note the single pass (see isSingleShotMessages).
-    const budget = readContextBudget()
-    const budgeted =
-      budget.contextTokens !== undefined ||
-      budget.maxContextPerCall !== undefined ||
-      budget.singleShot !== undefined
-    let singlePass = false
-    let chatFn: typeof chat | null = null
-    if (budgeted && budget.singleShot === true) {
-      chatFn = (config, messages, opts) => {
-        if (!singlePass && isSingleShotMessages(messages)) singlePass = true
-        return chat(config, messages, opts)
-      }
-    }
-    const s = createTranscriptStream(cfg, pr, {
-      imageDataUrls,
-      ...(budgeted ? { budget } : {}),
-      ...(chatFn !== null ? { chat: chatFn } : {}),
-    })
-    stream = s
-    streamSections = []
-    renderStreamTitle(title)
-    tts.load({ title, sections: [] })
-    applyPrefs()
-    if (mediaSession && mediaSession.available()) mediaSession.setMetadata(title)
-    const first = await s.next()
-    if (myLoad !== loadToken) return
-    if (first === null) {
-      stream = null
-      setStatus('Could not generate a transcript for this pull request.')
-      return
-    }
-    appendStreamSection(first)
-    updateControlStates(tts.state())
-    if (controlsEl) controlsEl.hidden = false
-    streamStarted = true
-    if (store) void store.recordListen(ref, headSha ?? '')
-    const resumeMsg = await applyResume(ref)
-    if (myLoad !== loadToken) return
-    const note = initialStreamStatus(resumeMsg, singlePass)
-    if (note) setStatus(note, 'info')
-    playbackActive = true
-    tts.play()
-    // Later sections arrive via onTtsChange prefetching (advanceStream).
-  } catch (err) {
-    if (!window.navigator.onLine || err instanceof TypeError) {
-      showOfflineBanner()
-    } else {
-      setStatus(sanitizeError(err))
-    }
-  } finally {
-    if (listenBtn) listenBtn.disabled = false
-    if (loadingEl) loadingEl.hidden = true
+    return
   }
+
+  // ---------- cache miss: stream as before ----------
+  if (!endpointOk) {
+    // Neither connect-src nor the SW proxy can reach that endpoint; CSP
+    // would turn the fetch into a TypeError and show a false "offline"
+    // banner. Fail with the real cause instead.
+    setStatus(CSP_ENDPOINT_MSG)
+    return
+  }
+  // images are best-effort: continue on failure
+  const token = (await vaultGetSecret('github-token')) ?? ''
+  const settled = await Promise.allSettled(
+    pr.imageUrls.map((u) => fetchImageAsDataUrl(u, token)),
+  )
+  const imageDataUrls = settled
+    .filter(
+      (r): r is PromiseFulfilledResult<string> => r.status === 'fulfilled',
+    )
+    .map((r) => r.value)
+  if (myLoad !== loadToken) return
+  // Context budget: only passed when the user set at least one knob, so an
+  // untouched install keeps the classic fixed batching. Single-shot can
+  // only fire when opted in; a chat wrapper watches for it so the status
+  // line can note the single pass (see isSingleShotMessages).
+  const budget = readContextBudget()
+  const budgeted =
+    budget.contextTokens !== undefined ||
+    budget.maxContextPerCall !== undefined ||
+    budget.singleShot !== undefined
+  let singlePass = false
+  const baseChat = makeChatFn()
+  let chatFn: typeof chat = baseChat
+  if (budgeted && budget.singleShot === true) {
+    chatFn = (config, messages, opts) => {
+      if (!singlePass && isSingleShotMessages(messages)) singlePass = true
+      return baseChat(config, messages, opts)
+    }
+  }
+  const s = createTranscriptStream(cfg, pr, {
+    imageDataUrls,
+    detail: readDetail(),
+    ...(budgeted ? { budget } : {}),
+    chat: chatFn,
+  })
+  stream = s
+  streamSections = []
+  renderStreamTitle(title)
+  tts.load({ title, sections: [] })
+  applyPrefs()
+  if (mediaSession && mediaSession.available()) mediaSession.setMetadata(title)
+  const first = await s.next()
+  if (myLoad !== loadToken) return
+  if (first === null) {
+    stream = null
+    setStatus('Could not generate a transcript for this pull request.')
+    return
+  }
+  appendStreamSection(first)
+  updateControlStates(tts.state())
+  if (controlsEl) controlsEl.hidden = false
+  streamStarted = true
+  if (store) void store.recordListen(ref, headSha ?? '')
+  const resumeMsg = await applyResume(ref)
+  if (myLoad !== loadToken) return
+  const note = initialStreamStatus(resumeMsg, singlePass) ?? fileNote
+  if (note) setStatus(note, 'info')
+  playbackActive = true
+  tts.play()
+  // Later sections arrive via onTtsChange prefetching (advanceStream).
 }
 
 // ---------- share target / query routing ----------
@@ -2269,9 +2931,6 @@ function init(): void {
   keyboard.attach()
   mediaSession = createMediaSessionController()
   if (mediaSession.available()) mediaSession.wireHandlers(tts)
-  vault.onLock(() => {
-    showLocked()
-  })
   // Auto-lock is an idle timer: any user activity resets it, so active
   // listening never gets cut off mid-playback.
   for (const type of ['pointerdown', 'keydown', 'touchstart'] as const) {
@@ -2285,19 +2944,40 @@ function init(): void {
   }
   document.addEventListener('visibilitychange', () => {
     vault.notifyActivity()
+    // Background honesty: browsers suspend speech synthesis in hidden tabs.
+    if (document.hidden) {
+      const st = tts.state()
+      if (st.playing && !st.paused) hiddenBanner.hidden = false
+    } else {
+      hiddenBanner.hidden = true
+    }
   })
   tts.onChange(onTtsChange)
   registerServiceWorker()
   wireOffline()
   pendingAutoStartUrl = routeSharedUrl()
 
-  if (lsGet(KEYS.vaultReady) !== '1') {
-    showSetup()
-  } else if (vault.isUnlocked()) {
-    showMain()
-  } else {
-    showLocked()
-  }
+  // First run = no gate: probe for saved persistent-vault records; without
+  // any, start an ephemeral session vault and go straight to the main view.
+  // A later launch with records shows the unlock screen (biometric button
+  // first when supported).
+  void (async (): Promise<void> => {
+    let hasRecords = false
+    try {
+      hasRecords = await vault.hasSecrets()
+    } catch {
+      hasRecords = false
+    }
+    if (hasRecords) {
+      vaultEphemeral = false
+      vault.onLock(() => {
+        showLocked()
+      })
+      showLocked()
+    } else {
+      startEphemeralSession()
+    }
+  })()
 }
 
 init()

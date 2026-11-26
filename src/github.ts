@@ -60,6 +60,124 @@ export function parsePrInput(input: string): PullRequestRef | null {
   return null
 }
 
+// ---------- Extended URL ingestion (blob/raw/commit/compare) ----------
+
+/** A file addressed by repo + git ref + path (blob/raw URLs). */
+export interface GitFileTarget {
+  owner: string
+  repo: string
+  ref: string
+  path: string
+}
+
+/** Everything the input box accepts, tagged by kind. */
+export type GitTarget =
+  | { kind: 'pr'; ref: PullRequestRef }
+  | { kind: 'file'; file: GitFileTarget }
+  | { kind: 'compare'; compare: { owner: string; repo: string; base: string; head: string } }
+  | { kind: 'commit'; commit: { owner: string; repo: string; sha: string } }
+
+const BLOB_URL_RE =
+  /^(?:https:\/\/)?github\.com\/([\w.-]+)\/([\w.-]+)\/(?:blob|raw)\/([^/?#]+)\/([^?#]+)/i
+const RAW_HOST_URL_RE =
+  /^(?:https:\/\/)?raw\.githubusercontent\.com\/([\w.-]+)\/([\w.-]+)\/([^/?#]+)\/([^?#]+)/i
+const COMMIT_URL_RE = /^(?:https:\/\/)?github\.com\/([\w.-]+)\/([\w.-]+)\/commit\/([0-9a-f]{7,40})/i
+// Two-dot (base..head) and three-dot (base...head) compare syntax are both
+// valid GitHub URLs; both are accepted and normalized to the three-dot
+// merge-base compare the API call uses.
+const COMPARE_URL_RE =
+  /^(?:https:\/\/)?github\.com\/([\w.-]+)\/([\w.-]+)\/compare\/([^/?#]+?)\.{2,3}([^/?#]+)/i
+
+function cleanPath(p: string): string {
+  return p.replace(/\/+$/, '')
+}
+
+/**
+ * Parse free-form input into any GitHub target: PR URLs/shorthand (kind
+ * 'pr'), blob/raw file URLs (kind 'file'), commit URLs (kind 'commit'),
+ * and compare URLs (kind 'compare'). Host matches case-insensitively and
+ * the scheme is optional. Returns null for anything else.
+ */
+export function parseGitTarget(input: string): GitTarget | null {
+  const trimmed = input.trim()
+  const pr = parsePrInput(trimmed)
+  if (pr !== null) return { kind: 'pr', ref: pr }
+  const compare = COMPARE_URL_RE.exec(trimmed)
+  if (compare && compare[1] !== undefined && compare[2] !== undefined && compare[3] !== undefined && compare[4] !== undefined) {
+    return { kind: 'compare', compare: { owner: compare[1], repo: compare[2], base: compare[3], head: compare[4] } }
+  }
+  const commit = COMMIT_URL_RE.exec(trimmed)
+  if (commit && commit[1] !== undefined && commit[2] !== undefined && commit[3] !== undefined) {
+    return { kind: 'commit', commit: { owner: commit[1], repo: commit[2], sha: commit[3] } }
+  }
+  const blob = BLOB_URL_RE.exec(trimmed)
+  if (blob && blob[1] !== undefined && blob[2] !== undefined && blob[3] !== undefined && blob[4] !== undefined) {
+    const path = cleanPath(blob[4])
+    if (path !== '') return { kind: 'file', file: { owner: blob[1], repo: blob[2], ref: blob[3], path } }
+  }
+  const raw = RAW_HOST_URL_RE.exec(trimmed)
+  if (raw && raw[1] !== undefined && raw[2] !== undefined && raw[3] !== undefined && raw[4] !== undefined) {
+    const path = cleanPath(raw[4])
+    if (path !== '') return { kind: 'file', file: { owner: raw[1], repo: raw[2], ref: raw[3], path } }
+  }
+  return null
+}
+
+// ---------- Pseudo-PR refs ----------
+
+/**
+ * Pseudo numbers start here: real PR numbers never reach this range, so a
+ * pseudo ref can never be mistaken for (or collide with) a real PR in the
+ * same repo. Consumers that branch on "is this a real PR" check against
+ * this floor (see fileChipHref in app.ts).
+ */
+export const PSEUDO_REF_FLOOR = 1_000_000_000
+
+/**
+ * Deterministic pseudo-PR number for non-PR targets (file / commit /
+ * compare / pasted text), derived from a seed unique to the target. The
+ * store keys resume positions, listen history and the queue by
+ * owner/repo#number alone, so every distinct pseudo-target needs its own
+ * number: two different files (or pastes, or compares) in one repo must
+ * not share a resume position or listen timestamp.
+ */
+export function pseudoRefNumber(seed: string): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return PSEUDO_REF_FLOOR + (h % 900_000_000)
+}
+
+/** Pseudo ref for a blob/raw file target; unique per repo+ref+path. */
+function filePseudoRef(t: GitFileTarget): PullRequestRef {
+  return { owner: t.owner, repo: t.repo, number: pseudoRefNumber(`file:${t.ref}:${t.path}`) }
+}
+
+/**
+ * The ref a routed input should be keyed under in the store: real PRs use
+ * their own ref; file/commit/compare targets get a deterministic pseudo ref
+ * so their resume/listen/cache records stay separate from each other and
+ * from real PRs in the same repo.
+ */
+export function pseudoTargetRef(target: GitTarget): PullRequestRef {
+  if (target.kind === 'pr') return target.ref
+  if (target.kind === 'file') return filePseudoRef(target.file)
+  if (target.kind === 'commit') {
+    return {
+      owner: target.commit.owner,
+      repo: target.commit.repo,
+      number: pseudoRefNumber(`commit:${target.commit.sha}`),
+    }
+  }
+  return {
+    owner: target.compare.owner,
+    repo: target.compare.repo,
+    number: pseudoRefNumber(`compare:${target.compare.base}...${target.compare.head}`),
+  }
+}
+
 // ---------- Generated-file filtering ----------
 
 const GENERATED_BASENAMES = new Set([
@@ -229,6 +347,7 @@ interface GhPull {
   head?: { sha?: string }
   additions?: number
   deletions?: number
+  changed_files?: number
 }
 interface GhFile {
   filename: string
@@ -310,6 +429,8 @@ export async function fetchPullRequest(ref: PullRequestRef, token: string): Prom
     deletions: pr.deletions ?? 0,
     ...(pr.head?.sha !== undefined ? { headSha: pr.head.sha } : {}),
     changedFiles: kept.length,
+    // Raw count before generated-file filtering, for the big-PR honesty note.
+    ...(pr.changed_files !== undefined ? { rawChangedFiles: pr.changed_files } : {}),
     files: kept,
     comments,
     reviews: mappedReviews,
@@ -363,6 +484,169 @@ export async function fetchNewCommits(
       message: (c.commit?.message ?? '').split('\n')[0] ?? '',
       date: c.commit?.committer?.date ?? '',
     }))
+}
+
+// ---------- File / commit / compare ingestion ----------
+
+interface GhCommitDetail {
+  sha?: string
+  commit?: { message?: string }
+  author?: GhUser
+  stats?: { additions?: number; deletions?: number }
+  files?: GhFile[]
+}
+
+interface GhCompare {
+  merge_base_commit?: { sha?: string }
+  commits?: Array<{ sha?: string; author?: GhUser }>
+  files?: GhFile[]
+}
+
+/**
+ * Fetch the content of a single file addressed by a GitFileTarget (blob /
+ * raw / raw.githubusercontent URL). Tries the public raw URL first; on a
+ * 404/401 with a token saved, falls back to the API contents endpoint
+ * (Accept: application/vnd.github.raw), which also serves private repos.
+ * The token is optional everywhere — empty means unauthenticated.
+ *
+ * The content is exposed twice, by design, so the transcript pipeline can
+ * batch it like a patch: body = 'File content:\n' + content, and
+ * files[0].patch = the raw content itself (additions/deletions are 0 —
+ * there is no diff).
+ */
+export async function fetchFileContent(t: GitFileTarget, token: string): Promise<PullRequestData> {
+  const rawUrl = `https://raw.githubusercontent.com/${t.owner}/${t.repo}/${t.ref}/${t.path}`
+  const headers: Record<string, string> = {}
+  if (token !== '') headers.Authorization = `Bearer ${token}`
+
+  let res: Response
+  try {
+    res = await fetch(rawUrl, { headers })
+  } catch (err) {
+    throw sanitizeError(err, token)
+  }
+  let content: string | null = null
+  if (res.ok) {
+    content = await res.text()
+  } else if (res.status !== 404 && res.status !== 401) {
+    throw await httpError(res, rawUrl, token)
+  } else if (token === '') {
+    throw await httpError(res, rawUrl, token)
+  } else {
+    const apiUrl = `${API_BASE}/repos/${t.owner}/${t.repo}/contents/${t.path}?ref=${encodeURIComponent(t.ref)}`
+    let ares: Response
+    try {
+      ares = await fetch(apiUrl, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw' },
+      })
+    } catch (err) {
+      throw sanitizeError(err, token)
+    }
+    if (!ares.ok) throw await httpError(ares, apiUrl, token)
+    content = await ares.text()
+  }
+
+  const body = `File content:\n${content}`
+  const basename = t.path.split('/').pop() ?? t.path
+  return {
+    // Pseudo ref unique to this repo+ref+path: resume positions and listen
+    // history are keyed by the ref, so two different files must not share one.
+    ref: filePseudoRef(t),
+    title: basename,
+    body,
+    author: t.owner,
+    additions: 0,
+    deletions: 0,
+    changedFiles: 1,
+    files: [{ filename: t.path, status: 'added', additions: 0, deletions: 0, patch: content }],
+    comments: [],
+    reviews: [],
+    imageUrls: extractImageUrls(body),
+    mermaidBlocks: extractMermaidBlocks(body),
+  }
+}
+
+/**
+ * Fetch a single commit's files and map them into PullRequestData:
+ * title = first line of the commit message, author = commit author login,
+ * headSha = commit sha, files filtered like PR files. Token optional.
+ */
+export async function fetchCommit(
+  owner: string,
+  repo: string,
+  sha: string,
+  token: string,
+): Promise<PullRequestData> {
+  const { data } = await ghFetchJson<GhCommitDetail>(
+    `${API_BASE}/repos/${owner}/${repo}/commits/${sha}`,
+    token,
+  )
+  const { kept } = filterGeneratedFiles((data.files ?? []).map(mapFile))
+  const message = data.commit?.message ?? ''
+  return {
+    // Pseudo ref unique to this commit: resume positions and listen history
+    // are keyed by the ref, so two commits must not share one.
+    ref: { owner, repo, number: pseudoRefNumber(`commit:${sha}`) },
+    title: message.split('\n')[0] ?? '',
+    body: message,
+    author: data.author?.login ?? 'unknown',
+    additions: data.stats?.additions ?? 0,
+    deletions: data.stats?.deletions ?? 0,
+    headSha: data.sha ?? sha,
+    changedFiles: kept.length,
+    files: kept,
+    comments: [],
+    reviews: [],
+    imageUrls: extractImageUrls(message),
+    mermaidBlocks: extractMermaidBlocks(message),
+  }
+}
+
+/**
+ * Fetch a compare (base...head) and map it into PullRequestData:
+ * title = '{base}...{head}', files with patches filtered like PR files,
+ * additions/deletions summed from the kept files. headSha combines the
+ * merge-base sha with the head commit sha: the merge base alone is shared
+ * by every compare into the same base, so keying the transcript cache on
+ * it would collide two different ranges; combining both sides makes the
+ * key unique to the range and refresh it when either side moves. Token
+ * optional.
+ */
+export async function fetchCompare(
+  owner: string,
+  repo: string,
+  base: string,
+  head: string,
+  token: string,
+): Promise<PullRequestData> {
+  const { data } = await ghFetchJson<GhCompare>(
+    `${API_BASE}/repos/${owner}/${repo}/compare/${base}...${head}`,
+    token,
+  )
+  const { kept } = filterGeneratedFiles((data.files ?? []).map(mapFile))
+  const commits = data.commits ?? []
+  const last = commits.length > 0 ? commits[commits.length - 1] : undefined
+  const lastAuthor = last?.author?.login
+  const additions = kept.reduce((n, f) => n + f.additions, 0)
+  const deletions = kept.reduce((n, f) => n + f.deletions, 0)
+  const body = `Comparing ${base}...${head} (${commits.length} commits)`
+  return {
+    // Pseudo ref unique to this base...head range: resume positions and
+    // listen history are keyed by the ref, so two ranges must not share one.
+    ref: { owner, repo, number: pseudoRefNumber(`compare:${base}...${head}`) },
+    title: `${base}...${head}`,
+    body,
+    author: lastAuthor ?? 'unknown',
+    additions,
+    deletions,
+    headSha: `${data.merge_base_commit?.sha ?? base}..${last?.sha ?? head}`,
+    changedFiles: kept.length,
+    files: kept,
+    comments: [],
+    reviews: [],
+    imageUrls: extractImageUrls(body),
+    mermaidBlocks: extractMermaidBlocks(body),
+  }
 }
 
 // ---------- Image fetching ----------
