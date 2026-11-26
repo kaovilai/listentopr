@@ -3,25 +3,33 @@
 // contract says class KeyVault; sibling currently exports it as Vault
 import { Vault as KeyVault, VaultError, isPrfSupported } from './vault'
 import {
-  parsePrUrl,
+  parsePrInput,
   findPrUrl,
   fetchPullRequest,
+  fetchNewCommits,
   fetchImageAsDataUrl,
 } from './github'
 import {
   createTranscriptStream,
   sanitizeLine,
+  buildDeltaSection,
   type TranscriptStreamHandle,
 } from './transcript'
 import { createTtsController, listVoices } from './tts'
 import { createWakeLockController, shouldShowWakeLockFallback } from './wakelock'
 import { createUpdateController, type UpdateController } from './update'
 import { connectSrcValue, endpointAllowedByConnectSrc } from './csp'
+import { createStore } from './store'
+import { createMediaSessionController, type MediaSessionController } from './mediasession'
+import { createKeyboardController, type KeyboardController } from './keyboard'
+import { createSleepTimer, type SleepTimer } from './sleeptimer'
 import type {
   LlmConfig,
   LlmProvider,
+  PullRequestData,
   PullRequestRef,
   SecretId,
+  Transcript,
   TranscriptSection,
   TtsState,
 } from './types'
@@ -65,6 +73,7 @@ const KEYS = {
   visionModel: 'listentopr.llm-vision-model',
   prefs: 'listentopr.tts-prefs',
   wlDismissed: 'listentopr.wl-banner-dismissed',
+  theme: 'listentopr.theme',
 } as const
 
 const PROVIDERS: readonly LlmProvider[] = ['openai', 'anthropic', 'gemini']
@@ -111,6 +120,11 @@ let root: HTMLElement | null = null
 let vault: KeyVault
 let tts: ReturnType<typeof createTtsController>
 let wakeLock: ReturnType<typeof createWakeLockController>
+/** Non-secret IndexedDB store: transcript cache, resume, queue, history. */
+let store: ReturnType<typeof createStore> | null = null
+let keyboard: KeyboardController | null = null
+let mediaSession: MediaSessionController | null = null
+let sleepTimer: SleepTimer | null = null
 
 let statusEl: HTMLElement | null = null
 const offlineBanner = el('div', 'banner banner-offline', 'Offline — check connection')
@@ -145,7 +159,30 @@ let stopBtn: HTMLButtonElement | null = null
 let voiceSelect: HTMLSelectElement | null = null
 let pendingAutoStartUrl: string | null = null
 
+// convenience-feature element refs (reassigned on each render)
+let scrubberRange: HTMLInputElement | null = null
+let scrubberTime: HTMLElement | null = null
+/** True while the user is dragging the scrubber (pointer down). */
+let scrubbing = false
+let tocEl: HTMLDetailsElement | null = null
+let tocListEl: HTMLOListElement | null = null
+let queueListEl: HTMLElement | null = null
+let actionsEl: HTMLElement | null = null
+let sleepLabelEl: HTMLElement | null = null
+let sleepTickId: number | null = null
+
+/** The PR currently loaded (or loading) into the player. */
+let currentRef: PullRequestRef | null = null
+let currentHeadSha: string | null = null
+let currentTitle = ''
+/** True between "playback started" and natural stop/finish. */
+let playbackActive = false
+/** Timestamp of the last throttled resume-position write. */
+let lastResumeWriteAt = 0
+
 const RATE_OPTIONS = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0]
+const PITCH_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+const SLEEP_PRESETS_MIN = [0, 10, 20, 30, 60]
 
 // ---------- status / errors ----------
 
@@ -177,6 +214,90 @@ function showOfflineBanner(): void {
   offlineBanner.hidden = false
 }
 
+// ---------- pure helpers (exported for tests) ----------
+
+/** Minimum gap between throttled resume-position writes. */
+export const RESUME_WRITE_INTERVAL_MS = 2000
+
+/** True when at least `RESUME_WRITE_INTERVAL_MS` elapsed since the last write. */
+export function shouldWriteResume(lastWriteAt: number, now: number): boolean {
+  return now - lastWriteAt >= RESUME_WRITE_INTERVAL_MS
+}
+
+/**
+ * What the sleep timer should do at expiry for the current player state.
+ * A pending stream hold needs a full stop: nothing is speaking (pause is a
+ * no-op) and the hold pipeline would restart audio when the next section
+ * arrives.
+ */
+export function sleepExpireAction(
+  state: TtsState,
+  holdPending: boolean,
+): 'pause' | 'stop' | 'none' {
+  if (state.playing && !state.paused) return 'pause'
+  if (holdPending) return 'stop'
+  return 'none'
+}
+
+/**
+ * True when the PR head moved past the latest cached transcript and a
+ * "What's New" delta section should be generated for the returning listener.
+ */
+export function shouldBuildDelta(
+  latestCachedSha: string | null,
+  currentHeadSha: string | null | undefined,
+): boolean {
+  if (!latestCachedSha || !currentHeadSha) return false
+  return latestCachedSha !== currentHeadSha
+}
+
+/** Map a scrubber ratio (0..1) onto a sentence queue index. */
+export function seekIndexFromRatio(ratio: number, totalSentences: number): number {
+  if (!Number.isFinite(ratio) || totalSentences <= 0) return 0
+  const r = Math.min(1, Math.max(0, ratio))
+  return Math.min(totalSentences - 1, Math.floor(r * totalSentences))
+}
+
+/** Seconds as "m:ss" (clamped at zero, non-finite treated as zero). */
+export function formatTime(seconds: number): string {
+  const s = !Number.isFinite(seconds) || seconds < 0 ? 0 : Math.floor(seconds)
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+/** Human label for a flat resume index: "section 2, sentence 3" (1-based). */
+export function describeResumePosition(
+  sections: TranscriptSection[],
+  sentenceIndex: number,
+): string {
+  let remaining = sentenceIndex
+  for (const section of sections) {
+    const n = section.sentences.length
+    if (remaining < n) {
+      const si = sections.indexOf(section)
+      return `section ${si + 1}, sentence ${remaining + 1}`
+    }
+    remaining -= n
+  }
+  return `sentence ${sentenceIndex + 1}`
+}
+
+/** Short "previously heard" summary for the delta prompt: first two sentences. */
+export function summarizeTranscript(t: Transcript): string {
+  const sentences = t.sections.flatMap((s) => s.sentences).slice(0, 2)
+  return sentences.join(' ')
+}
+
+/** Plain-text rendering of a transcript (copy / download / share). */
+export function transcriptToText(title: string, sections: TranscriptSection[]): string {
+  const parts: string[] = [title, '']
+  for (const s of sections) {
+    parts.push(`## ${s.title}`)
+    parts.push(s.sentences.join(' '))
+    parts.push('')
+  }
+  return parts.join('\n').trim() + '\n'
+}
+
 // ---------- CSP endpoint validation ----------
 // connect-src is baked at build time, so a Settings endpoint whose origin is
 // not already allowed would be CSP-blocked at fetch time and surface as a
@@ -196,6 +317,22 @@ function llmEndpointAllowed(endpoint: string): boolean {
 const CSP_ENDPOINT_MSG =
   'LLM endpoint is not allowed by this build\'s Content-Security-Policy. ' +
   'Rebuild with VITE_LLM_ENDPOINT set to that origin, or use an allowed endpoint.'
+
+// ---------- theme ----------
+
+/** Persisted theme; 'dark' unless explicitly set to 'light'. */
+export function readTheme(): 'dark' | 'light' {
+  return lsGet(KEYS.theme) === 'light' ? 'light' : 'dark'
+}
+
+/** Apply the persisted theme to <body> (variables live in styles.css). */
+function applyTheme(): void {
+  try {
+    document.body.classList.toggle('theme-light', readTheme() === 'light')
+  } catch {
+    // no body in this environment — nothing to theme
+  }
+}
 
 // ---------- vault adapters ----------
 // The integration contract (boolean unlocks, sync getSecret, isPrfSupported
@@ -335,6 +472,7 @@ function showLocked(): void {
   if (!root) return
   // stop playback and drop transcript (and any in-flight stream) on lock
   abortActiveStream()
+  playbackActive = false
   try {
     tts.stop()
   } catch {
@@ -472,6 +610,8 @@ function buildSettingsPanel(): HTMLDivElement {
         wipe.disabled = false
         return
       }
+      // The non-secret store (transcripts, queue, history) is deliberately
+      // NOT wiped here: it holds no key material.
       lsRemove(KEYS.vaultReady)
       lsRemove(KEYS.provider)
       lsRemove(KEYS.endpoint)
@@ -531,6 +671,62 @@ function updateControlStates(state: TtsState): void {
   if (stopBtn) stopBtn.disabled = !(state.playing || state.paused) && !streamHolding
 }
 
+/** Scrubber time label; reflects the pending (dragging) value while scrubbing. */
+function updateScrubber(): void {
+  if (!scrubberRange || !scrubberTime) return
+  const p = tts.getProgress()
+  const max = Math.max(1, p.totalSentences - 1)
+  if (!scrubbing) {
+    scrubberRange.max = String(max)
+    scrubberRange.value = String(Math.min(p.sentenceIndex, max))
+  }
+  const denom = Math.max(1, Number(scrubberRange.max))
+  const v = Number(scrubberRange.value)
+  const ratio = Math.min(1, Math.max(0, v / denom))
+  scrubberTime.textContent =
+    `${formatTime(ratio * p.totalEstimatedSeconds)} of ${formatTime(p.totalEstimatedSeconds)}`
+}
+
+/** Throttled resume-position persistence while playing. */
+function maybeSaveResume(): void {
+  if (!store || !currentRef) return
+  const now = Date.now()
+  if (!shouldWriteResume(lastResumeWriteAt, now)) return
+  lastResumeWriteAt = now
+  void store.setResume(currentRef, tts.getProgress().sentenceIndex)
+}
+
+/** Seek to a saved resume position; returns the status line or null. */
+async function applyResume(ref: PullRequestRef): Promise<string | null> {
+  if (!store) return null
+  let saved: number | null = null
+  try {
+    saved = await store.getResume(ref)
+  } catch {
+    saved = null
+  }
+  if (saved === null || saved <= 0) return null
+  tts.seekTo(saved)
+  return `Resumed at ${describeResumePosition(streamSections, saved)}`
+}
+
+/** Natural end of playback: clear resume, advance the queue. */
+function onNaturalEnd(): void {
+  playbackActive = false
+  const ref = currentRef
+  if (!ref) return
+  if (store) void store.clearResume(ref)
+  if (!store) return
+  const myToken = loadToken
+  void (async () => {
+    const next = await store!.dequeue()
+    if (!next) return
+    if (myToken !== loadToken) return
+    setStatus(`Up next: ${next.title}`, 'info')
+    await startLoadRef(next.ref, true)
+  })()
+}
+
 function onTtsChange(state: TtsState): void {
   if (state.playing || state.paused) {
     setActiveSentence(state.sectionIndex, state.sentenceIndex)
@@ -545,6 +741,25 @@ function onTtsChange(state: TtsState): void {
       .catch(() => undefined)
   } else {
     wakeLock.release()
+  }
+  // Convenience wiring: scrubber, resume autosave, OS media session.
+  updateScrubber()
+  if (state.playing && !state.paused) {
+    maybeSaveResume()
+    if (mediaSession && mediaSession.available()) {
+      mediaSession.updatePositionState(tts.getProgress())
+    }
+  } else if (!state.paused && playbackActive) {
+    // Speech stopped mid-load: a natural finish only when the stream has no
+    // more content coming (otherwise the hold logic below takes over).
+    const s = stream
+    const moreComing = s !== null && streamStarted && !s.done()
+    if (!moreComing) {
+      const p = tts.getProgress()
+      if (p.totalSentences > 0 && p.sentenceIndex >= p.totalSentences - 1) {
+        onNaturalEnd()
+      }
+    }
   }
   // Streaming pipeline: prefetch ahead of speech, hold at the ready edge.
   const s = stream
@@ -576,6 +791,7 @@ function onTtsChange(state: TtsState): void {
 /** Stop speech and cancel any in-flight transcript stream. */
 function stopPlayback(): void {
   const wasHolding = streamHolding
+  playbackActive = false
   abortActiveStream()
   tts.stop()
   if (wasHolding) clearStatus()
@@ -612,7 +828,7 @@ export function shouldPrefetchNow(
 
 /** True when playback ran out of ready content while the stream has more. */
 export function streamHoldNeeded(state: TtsState, info: StreamHoldInfo): boolean {
-  return info.active && info.started && !info.done && !state.playing && !state.paused
+  return info.active && info.started && info.done === false && !state.playing && !state.paused
 }
 
 let stream: TranscriptStreamHandle | null = null
@@ -650,6 +866,7 @@ function renderStreamTitle(title: string): void {
   transcriptEl.textContent = ''
   transcriptEl.appendChild(el('h2', 'transcript-title', title))
   transcriptEl.hidden = false
+  if (actionsEl) actionsEl.hidden = false
 }
 
 /** Append one section to the transcript view; indices match the tts queue. */
@@ -663,9 +880,9 @@ function appendSectionToView(section: TranscriptSection): void {
     const span = el('span', 'sentence', sentence)
     span.dataset.si = String(si)
     span.dataset.i = String(i)
-    // controller has no seek API; click gives visual focus + scroll
     span.addEventListener('click', () => {
       setActiveSentence(si, i)
+      tts.seekTo(flatSentenceCursor(streamSections, si, i))
     })
     wrap.appendChild(span)
     wrap.appendChild(document.createTextNode(' '))
@@ -679,6 +896,7 @@ function appendStreamSection(section: TranscriptSection): void {
   appendSectionToView(section)
   streamSections.push(section)
   tts.appendSections([section])
+  renderToc()
 }
 
 /** Flat queue position of (sectionIndex, sentenceIndex) within sections. */
@@ -746,6 +964,16 @@ function consumeNextStreamSection(s: TranscriptStreamHandle): void {
         streamHolding = false
         clearStatus()
         updateControlStates(tts.state())
+      }
+      // Fully generated transcript: cache it for instant reload next time.
+      if (
+        streamStarted && store && currentRef && currentHeadSha &&
+        streamSections.length > 0
+      ) {
+        void store.putTranscript(currentRef, currentHeadSha, {
+          title: currentTitle,
+          sections: streamSections,
+        })
       }
       return
     }
@@ -822,10 +1050,70 @@ function populateVoiceSelect(): void {
 /** Current voiceschanged handler, so a re-render replaces the previous one. */
 let voiceChangedHandler: (() => void) | null = null
 
+// ---------- sleep timer label ----------
+
+function updateSleepLabel(): void {
+  if (!sleepLabelEl) return
+  const ms = sleepTimer ? sleepTimer.remainingMs() : null
+  sleepLabelEl.textContent = ms === null ? '' : formatTime(ms / 1000)
+}
+
+// ---------- controls ----------
+
 function buildControls(): HTMLDivElement {
   const controls = el('div', 'controls')
   controls.hidden = true
   controlsEl = controls
+
+  // Scrubber: range input drives seekTo; time shown as "m:ss of m:ss".
+  const scrubRow = el('div', 'scrubber-row')
+  const scrub = el('input', 'scrubber-range')
+  scrub.type = 'range'
+  scrub.min = '0'
+  scrub.max = '1'
+  scrub.step = '1'
+  scrub.value = '0'
+  scrub.title = 'Seek'
+  scrub.setAttribute('aria-label', 'Seek position')
+  scrubberRange = scrub
+  scrubbing = false
+  const timeLabel = el('span', 'scrubber-time', '0:00 of 0:00')
+  scrubberTime = timeLabel
+  scrub.addEventListener('pointerdown', (ev) => {
+    scrubbing = true
+    // Mouse drags get no implicit pointer capture: released outside the
+    // track, the pointerup never reaches this element and `scrubbing` sticks
+    // (thumb + time label then freeze at the dragged value). Explicit
+    // capture guarantees the release is delivered here.
+    try {
+      scrub.setPointerCapture(ev.pointerId)
+    } catch {
+      // best-effort — touch/pen keep implicit capture anyway
+    }
+  })
+  scrub.addEventListener('pointerup', () => {
+    scrubbing = false
+  })
+  scrub.addEventListener('pointercancel', () => {
+    scrubbing = false
+  })
+  scrub.addEventListener('lostpointercapture', () => {
+    scrubbing = false
+  })
+  const seekPending = () => {
+    const v = Number(scrub.value)
+    if (Number.isFinite(v)) tts.seekTo(Math.round(v))
+    updateScrubber()
+  }
+  scrub.addEventListener('input', () => {
+    // Pointer drags seek on release ('change'); keyboard arrows seek at once.
+    if (scrubbing) updateScrubber()
+    else seekPending()
+  })
+  scrub.addEventListener('change', seekPending)
+  scrubRow.appendChild(scrub)
+  scrubRow.appendChild(timeLabel)
+  controls.appendChild(scrubRow)
 
   const prevSection = el('button', 'btn btn-icon', '«')
   prevSection.type = 'button'
@@ -883,6 +1171,46 @@ function buildControls(): HTMLDivElement {
     writePrefs(cur.voiceName, rate)
   })
 
+  // Pitch: 0.5-2.0, persisted through the tts controller's own prefs.
+  const pitchSel = el('select', 'select select-pitch')
+  pitchSel.title = 'Pitch'
+  pitchSel.setAttribute('aria-label', 'Pitch')
+  const curPitch = tts.getPrefs().pitch
+  PITCH_OPTIONS.forEach((p) => {
+    const opt = el('option', undefined, `${p}`)
+    opt.value = String(p)
+    if (Math.abs(p - curPitch) < 0.001) opt.selected = true
+    pitchSel.appendChild(opt)
+  })
+  pitchSel.addEventListener('change', () => {
+    tts.setPitch(Number(pitchSel.value))
+  })
+
+  // Sleep timer presets; expiry pauses playback.
+  const sleepSel = el('select', 'select select-sleep')
+  sleepSel.title = 'Sleep timer'
+  sleepSel.setAttribute('aria-label', 'Sleep timer')
+  SLEEP_PRESETS_MIN.forEach((m) => {
+    const opt = el('option', undefined, m === 0 ? 'Sleep: off' : `${m} min`)
+    opt.value = String(m)
+    sleepSel.appendChild(opt)
+  })
+  sleepSel.addEventListener('change', () => {
+    const mins = Number(sleepSel.value)
+    if (sleepTimer) {
+      if (Number.isFinite(mins) && mins > 0) sleepTimer.start(mins * 60_000)
+      else sleepTimer.cancel()
+    }
+    updateSleepLabel()
+  })
+  const sleepLabel = el('span', 'sleep-remaining')
+  sleepLabelEl = sleepLabel
+  if (sleepTickId !== null) {
+    window.clearInterval(sleepTickId)
+    sleepTickId = null
+  }
+  sleepTickId = window.setInterval(updateSleepLabel, 500)
+
   const voice = el('select', 'select select-voice')
   voice.title = 'Voice'
   voice.setAttribute('aria-label', 'Voice')
@@ -922,7 +1250,197 @@ function buildControls(): HTMLDivElement {
   controls.appendChild(nextSection)
   controls.appendChild(speed)
   controls.appendChild(voice)
+  controls.appendChild(pitchSel)
+  controls.appendChild(sleepSel)
+  controls.appendChild(sleepLabel)
   return controls
+}
+
+// ---------- section TOC ----------
+
+function buildToc(): HTMLDetailsElement {
+  const details = el('details', 'toc')
+  details.appendChild(el('summary', 'toc-summary', 'Sections'))
+  tocListEl = el('ol', 'toc-list')
+  details.appendChild(tocListEl)
+  tocEl = details
+  return details
+}
+
+/** Rebuild the clickable section list from streamSections. */
+function renderToc(): void {
+  if (!tocListEl || !tocEl) return
+  const hadItems = tocListEl.childElementCount > 0
+  tocListEl.textContent = ''
+  streamSections.forEach((section, si) => {
+    const li = el('li', 'toc-item')
+    const btn = el('button', 'btn btn-small toc-link', section.title)
+    btn.type = 'button'
+    btn.addEventListener('click', () => {
+      tts.seekTo(flatSentenceCursor(streamSections, si, 0))
+    })
+    li.appendChild(btn)
+    tocListEl!.appendChild(li)
+  })
+  if (!hadItems && streamSections.length > 0) {
+    // Side pane stays expanded on wide screens; collapsible on narrow ones.
+    let wide = false
+    try {
+      wide = window.matchMedia('(min-width: 900px)').matches
+    } catch {
+      wide = false
+    }
+    tocEl.open = wide
+  }
+}
+
+// ---------- queue list ----------
+
+/** Re-render the queue list from the store (hidden when empty). */
+async function refreshQueueList(): Promise<void> {
+  if (!queueListEl || !store) return
+  const items = store ? await store.queueAll() : []
+  queueListEl.textContent = ''
+  if (items.length === 0) {
+    queueListEl.hidden = true
+    return
+  }
+  queueListEl.hidden = false
+  for (const item of items) {
+    const row = el('div', 'queue-row')
+    row.appendChild(el('span', 'queue-title', item.title))
+    const rm = el('button', 'btn btn-small', 'Remove')
+    rm.type = 'button'
+    rm.addEventListener('click', () => {
+      if (!store) return
+      void store.removeFromQueue(item.ref).then(() => {
+        void refreshQueueList()
+      })
+    })
+    row.appendChild(rm)
+    queueListEl.appendChild(row)
+  }
+}
+
+/** Queue whatever is currently in the input box (without loading it). */
+async function enqueueFromInput(input: string): Promise<void> {
+  const ref = parsePrInput(input)
+  if (!ref) {
+    setStatus('Enter a pull request URL or owner/repo#123 to queue.')
+    return
+  }
+  if (!store) return
+  const same =
+    currentRef !== null &&
+    currentRef.owner === ref.owner &&
+    currentRef.repo === ref.repo &&
+    currentRef.number === ref.number
+  await store.enqueue({
+    ref,
+    title: same ? currentTitle : `${ref.owner}/${ref.repo}#${ref.number}`,
+    addedAt: Date.now(),
+  })
+  await refreshQueueList()
+  setStatus('Added to queue.', 'info')
+}
+
+// ---------- export / share ----------
+
+function buildTranscriptActions(): HTMLDivElement {
+  const row = el('div', 'transcript-actions')
+  row.hidden = true
+  actionsEl = row
+
+  const copy = el('button', 'btn btn-small', 'Copy transcript')
+  copy.type = 'button'
+  copy.addEventListener('click', () => {
+    void copyTranscript()
+  })
+
+  const download = el('button', 'btn btn-small', 'Download .txt')
+  download.type = 'button'
+  download.addEventListener('click', () => {
+    downloadTranscript()
+  })
+
+  const share = el('button', 'btn btn-small', 'Share')
+  share.type = 'button'
+  share.addEventListener('click', () => {
+    void shareTranscript()
+  })
+
+  row.appendChild(copy)
+  row.appendChild(download)
+  row.appendChild(share)
+  return row
+}
+
+async function copyTranscript(): Promise<void> {
+  const text = transcriptToText(currentTitle, streamSections)
+  let ok = false
+  try {
+    if (window.navigator.clipboard) {
+      await window.navigator.clipboard.writeText(text)
+      ok = true
+    }
+  } catch {
+    ok = false
+  }
+  if (!ok) ok = legacyCopy(text)
+  setStatus(
+    ok ? 'Transcript copied.' : 'Could not copy the transcript.',
+    ok ? 'info' : 'error',
+  )
+}
+
+/** Pre-async-clipboard fallback: offscreen textarea + execCommand. */
+function legacyCopy(text: string): boolean {
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.className = 'offscreen-copy'
+    document.body.appendChild(ta)
+    ta.select()
+    const copied = document.execCommand('copy')
+    ta.remove()
+    return copied
+  } catch {
+    return false
+  }
+}
+
+function downloadTranscript(): void {
+  try {
+    const text = transcriptToText(currentTitle, streamSections)
+    const blob = new Blob([text], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = el('a')
+    a.href = url
+    const slug =
+      currentTitle.replace(/[^a-z0-9._-]+/gi, '-').slice(0, 60) || 'transcript'
+    a.download = `${slug}.txt`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (err) {
+    setStatus(sanitizeError(err))
+  }
+}
+
+async function shareTranscript(): Promise<void> {
+  if (typeof window.navigator.share !== 'function') {
+    setStatus('Sharing is not supported here.')
+    return
+  }
+  try {
+    await window.navigator.share({
+      title: currentTitle,
+      text: transcriptToText(currentTitle, streamSections),
+    })
+  } catch {
+    // user cancelled the share sheet — nothing to report
+  }
 }
 
 // ---------- main view ----------
@@ -935,6 +1453,13 @@ function showMain(): void {
   header.appendChild(el('h1', 'app-title', 'ListenToPR'))
   const headerActions = el('div', 'header-actions')
 
+  const themeBtn = el('button', 'btn btn-secondary', 'Theme')
+  themeBtn.type = 'button'
+  themeBtn.addEventListener('click', () => {
+    lsSet(KEYS.theme, readTheme() === 'dark' ? 'light' : 'dark')
+    applyTheme()
+  })
+
   const settingsBtn = el('button', 'btn btn-secondary', 'Settings')
   settingsBtn.type = 'button'
   const lockBtn = el('button', 'btn btn-secondary', 'Lock')
@@ -942,6 +1467,7 @@ function showMain(): void {
   lockBtn.addEventListener('click', () => {
     vault.lock() // onLock listener switches to the locked view
   })
+  headerActions.appendChild(themeBtn)
   headerActions.appendChild(settingsBtn)
   headerActions.appendChild(lockBtn)
   header.appendChild(headerActions)
@@ -976,27 +1502,44 @@ function showMain(): void {
   const urlInput = el('input', 'field-input pr-input')
   urlInput.type = 'text'
   urlInput.autocomplete = 'off'
-  urlInput.placeholder = 'https://github.com/owner/repo/pull/123'
+  urlInput.placeholder = 'PR URL or owner/repo#123'
   urlInput.setAttribute('aria-label', 'Pull request URL')
   listenBtn = el('button', 'btn btn-primary', 'Listen')
   listenBtn.type = 'submit'
+  const queueBtn = el('button', 'btn', 'Add to queue')
+  queueBtn.type = 'button'
+  queueBtn.addEventListener('click', () => {
+    void enqueueFromInput(urlInput.value.trim())
+  })
   form.appendChild(urlInput)
   form.appendChild(listenBtn)
+  form.appendChild(queueBtn)
   form.addEventListener('submit', (e) => {
     e.preventDefault()
     void startLoad(urlInput.value.trim())
   })
   main.appendChild(form)
 
+  queueListEl = el('div', 'queue-list')
+  queueListEl.hidden = true
+  main.appendChild(queueListEl)
+  void refreshQueueList()
+
   loadingEl = el('p', 'muted loading')
   loadingEl.textContent = 'Loading pull request…'
   loadingEl.hidden = true
   main.appendChild(loadingEl)
 
+  // TOC beside the transcript: side pane on wide screens, collapsible above
+  // it on narrow ones (the details element collapses without JavaScript).
+  const split = el('div', 'main-split')
+  split.appendChild(buildToc())
   transcriptEl = el('article', 'transcript')
   transcriptEl.hidden = true
-  main.appendChild(transcriptEl)
+  split.appendChild(transcriptEl)
+  main.appendChild(split)
 
+  main.appendChild(buildTranscriptActions())
   main.appendChild(buildControls())
   root.appendChild(main)
 
@@ -1018,42 +1561,126 @@ function prUrlString(ref: PullRequestRef): string {
 
 async function startLoad(url: string): Promise<void> {
   if (!url) {
-    setStatus('Enter a GitHub pull request URL.')
+    setStatus('Enter a GitHub pull request URL or owner/repo#123.')
     return
   }
-  const ref = parsePrUrl(url)
+  const ref = parsePrInput(url)
   if (!ref) {
-    setStatus('Not a valid GitHub pull request URL.')
+    setStatus('Not a valid pull request. Use a GitHub URL or owner/repo#123.')
     return
   }
+  await startLoadRef(ref)
+}
+
+/**
+ * Best-effort "What's New" delta for a returning listener: commits since the
+ * last listen, summarized against the previously heard transcript. Any
+ * failure degrades to the plain cached transcript.
+ */
+async function buildDelta(
+  ref: PullRequestRef,
+  pr: PullRequestData,
+  sinceSha: string,
+  cfg: LlmConfig,
+  token: string,
+  endpointOk: boolean,
+): Promise<TranscriptSection | null> {
+  if (!store || !endpointOk) return null
+  try {
+    const previous = await store.getCachedTranscript(ref, sinceSha)
+    if (!previous) return null
+    const last = await store.lastListen(ref)
+    const sinceIso = last ? new Date(last.at).toISOString() : ''
+    const commits = await fetchNewCommits(ref, sinceIso, token)
+    if (commits.length === 0) return null
+    return await buildDeltaSection(cfg, pr, commits, summarizeTranscript(previous))
+  } catch {
+    // Delta is best-effort: fall back to the plain cached transcript.
+    return null
+  }
+}
+
+/**
+ * Load a fully-generated transcript (cache hit): render everything, apply
+ * the saved resume position, and start playing.
+ */
+async function loadFullTranscript(
+  ref: PullRequestRef,
+  headSha: string | null,
+  title: string,
+  sections: TranscriptSection[],
+  statusMsg: string,
+  skipResume: boolean,
+): Promise<void> {
+  stream = null
+  streamSections = []
+  streamStarted = false
+  streamHolding = false
+  streamHoldFlatIndex = null
+  playbackActive = false
+  renderStreamTitle(title)
+  for (const section of sections) {
+    appendSectionToView(section)
+    streamSections.push(section)
+  }
+  tts.load({ title, sections })
+  applyPrefs()
+  if (controlsEl) controlsEl.hidden = false
+  updateControlStates(tts.state())
+  renderToc()
+  updateScrubber()
+  if (mediaSession && mediaSession.available()) mediaSession.setMetadata(title)
+  if (store) {
+    void store.recordListen(ref, headSha ?? '')
+    // A What's-New delta was prepended to cached sections: persist the merged
+    // transcript under this head, or it exists only in memory and every later
+    // load of the same head regenerates the delta through the LLM.
+    if (headSha !== null && skipResume) {
+      void store.putTranscript(ref, headSha, { title, sections })
+    }
+  }
+  // Resume where the listener left off — skipped when a What's-New delta was
+  // prepended: the delta must play from the top.
+  let resumeMsg: string | null = null
+  if (!skipResume) resumeMsg = await applyResume(ref)
+  setStatus(resumeMsg ?? statusMsg, 'info')
+  playbackActive = true
+  tts.play()
+}
+
+async function startLoadRef(ref: PullRequestRef, fromQueue = false): Promise<void> {
   clearStatus()
   // New load supersedes any in-flight stream (also invalidates older loads).
   abortActiveStream()
+  playbackActive = false
+  // Stop the old PR's speech BEFORE currentRef moves: onTtsChange keeps
+  // firing while the old transcript's utterances advance during the fetch
+  // window, and maybeSaveResume would write the old position under the NEW
+  // PR's resume key (first write immediate: lastResumeWriteAt resets to 0).
+  try {
+    tts.stop()
+  } catch {
+    // ignore — nothing was playing
+  }
+  lastResumeWriteAt = 0
+  currentRef = ref
   const myLoad = loadToken
   if (listenBtn) listenBtn.disabled = true
   if (loadingEl) loadingEl.hidden = false
   if (transcriptEl) transcriptEl.hidden = true
+  if (actionsEl) actionsEl.hidden = true
   if (controlsEl) controlsEl.hidden = true
   try {
     const token = (await vaultGetSecret('github-token')) ?? ''
     const pr = await fetchPullRequest(ref, token)
     if (myLoad !== loadToken) return
-    // images are best-effort: continue on failure
-    const settled = await Promise.allSettled(
-      pr.imageUrls.map((u) => fetchImageAsDataUrl(u, token)),
-    )
-    const imageDataUrls = settled
-      .filter(
-        (r): r is PromiseFulfilledResult<string> => r.status === 'fulfilled',
-      )
-      .map((r) => r.value)
+    const title = sanitizeLine(pr.title) || 'Pull request'
+    const headSha = pr.headSha ?? null
+    currentHeadSha = headSha
+    currentTitle = title
+
     const endpoint = lsGet(KEYS.endpoint) ?? ''
-    if (endpoint !== '' && !llmEndpointAllowed(endpoint)) {
-      // CSP would turn the fetch into a TypeError and show a false
-      // "offline" banner; fail with the real cause instead.
-      setStatus(CSP_ENDPOINT_MSG)
-      return
-    }
+    const endpointOk = endpoint === '' || llmEndpointAllowed(endpoint)
     const visionModel = (lsGet(KEYS.visionModel) ?? '').trim()
     const cfg: LlmConfig = {
       provider: readProvider(),
@@ -1063,13 +1690,63 @@ async function startLoad(url: string): Promise<void> {
       ...(visionModel !== '' ? { visionModel } : {}),
     }
     if (myLoad !== loadToken) return
-    const title = sanitizeLine(pr.title) || 'Pull request'
+
+    // ---------- cache hit: instant load, no LLM ----------
+    let cached: Transcript | null = null
+    if (store && headSha) {
+      cached = await store.getCachedTranscript(ref, headSha)
+      if (myLoad !== loadToken) return
+    }
+    if (cached !== null) {
+      let sections = cached.sections
+      let deltaApplied = false
+      if (store && headSha) {
+        const latestSha = await store.latestCachedSha(ref)
+        if (myLoad !== loadToken) return
+        if (shouldBuildDelta(latestSha, headSha) && latestSha !== null) {
+          const delta = await buildDelta(ref, pr, latestSha, cfg, token, endpointOk)
+          if (myLoad !== loadToken) return
+          if (delta) {
+            sections = [delta, ...sections]
+            deltaApplied = true
+          }
+        }
+      }
+      await loadFullTranscript(
+        ref,
+        headSha,
+        title,
+        sections,
+        fromQueue ? `Up next: ${title}` : 'Loaded from cache',
+        deltaApplied,
+      )
+      return
+    }
+
+    // ---------- cache miss: stream as before ----------
+    if (!endpointOk) {
+      // CSP would turn the fetch into a TypeError and show a false
+      // "offline" banner; fail with the real cause instead.
+      setStatus(CSP_ENDPOINT_MSG)
+      return
+    }
+    // images are best-effort: continue on failure
+    const settled = await Promise.allSettled(
+      pr.imageUrls.map((u) => fetchImageAsDataUrl(u, token)),
+    )
+    const imageDataUrls = settled
+      .filter(
+        (r): r is PromiseFulfilledResult<string> => r.status === 'fulfilled',
+      )
+      .map((r) => r.value)
+    if (myLoad !== loadToken) return
     const s = createTranscriptStream(cfg, pr, { imageDataUrls })
     stream = s
     streamSections = []
     renderStreamTitle(title)
     tts.load({ title, sections: [] })
     applyPrefs()
+    if (mediaSession && mediaSession.available()) mediaSession.setMetadata(title)
     const first = await s.next()
     if (myLoad !== loadToken) return
     if (first === null) {
@@ -1081,6 +1758,11 @@ async function startLoad(url: string): Promise<void> {
     updateControlStates(tts.state())
     if (controlsEl) controlsEl.hidden = false
     streamStarted = true
+    if (store) void store.recordListen(ref, headSha ?? '')
+    const resumeMsg = await applyResume(ref)
+    if (myLoad !== loadToken) return
+    if (resumeMsg) setStatus(resumeMsg, 'info')
+    playbackActive = true
     tts.play()
     // Later sections arrive via onTtsChange prefetching (advanceStream).
   } catch (err) {
@@ -1102,7 +1784,7 @@ function routeSharedUrl(): string | null {
   try {
     const params = new URLSearchParams(window.location.search)
     const pr = params.get('pr')
-    if (pr) ref = parsePrUrl(pr)
+    if (pr) ref = parsePrInput(pr)
     if (!ref) {
       for (const key of ['text', 'url']) {
         const val = params.get(key)
@@ -1158,9 +1840,30 @@ function registerServiceWorker(): void {
 function init(): void {
   root = document.getElementById('app')
   if (!root) return
+  applyTheme()
   vault = new KeyVault()
   tts = createTtsController()
   wakeLock = createWakeLockController()
+  store = createStore()
+  sleepTimer = createSleepTimer()
+  sleepTimer.onExpire(() => {
+    const action = sleepExpireAction(tts.state(), streamHolding)
+    if (action === 'pause') {
+      tts.pause()
+    } else if (action === 'stop') {
+      // Mid-hold nothing is speaking, so pause() is a guarded no-op — yet
+      // the hold pipeline would call tts.play() once the in-flight section
+      // lands, playing audio well past the deadline. Tear the hold (and its
+      // stream) down instead.
+      stopPlayback()
+    }
+    setStatus('Sleep timer elapsed — playback paused.', 'info')
+    updateSleepLabel()
+  })
+  keyboard = createKeyboardController({ tts, document, onStop: stopPlayback })
+  keyboard.attach()
+  mediaSession = createMediaSessionController()
+  if (mediaSession.available()) mediaSession.wireHandlers(tts)
   vault.onLock(() => {
     showLocked()
   })

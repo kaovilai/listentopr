@@ -34,6 +34,32 @@ export function findPrUrl(text: string): PullRequestRef | null {
   return { owner: m[1], repo: m[2], number: Number(m[3]) }
 }
 
+const BARE_PR_URL_RE =
+  /^github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)(?:\/files)?\/?(?:[?#].*)?$/i
+
+const SHORTHAND_RE = /^([\w.-]+)\/([\w.-]+)#(\d+)$/
+
+/**
+ * Parse free-form user input into a PR ref. Accepts everything parsePrUrl
+ * takes, plus scheme-less github.com URLs and 'owner/repo#123' shorthand.
+ * Input is whitespace-trimmed; the host matches case-insensitively.
+ * Returns null for anything else.
+ */
+export function parsePrInput(input: string): PullRequestRef | null {
+  const trimmed = input.trim()
+  const full = parsePrUrl(trimmed)
+  if (full !== null) return full
+  const bare = BARE_PR_URL_RE.exec(trimmed)
+  if (bare && bare[1] !== undefined && bare[2] !== undefined && bare[3] !== undefined) {
+    return { owner: bare[1], repo: bare[2], number: Number(bare[3]) }
+  }
+  const short = SHORTHAND_RE.exec(trimmed)
+  if (short && short[1] !== undefined && short[2] !== undefined && short[3] !== undefined) {
+    return { owner: short[1], repo: short[2], number: Number(short[3]) }
+  }
+  return null
+}
+
 // ---------- Generated-file filtering ----------
 
 const GENERATED_BASENAMES = new Set([
@@ -188,6 +214,7 @@ interface GhPull {
   title?: string
   body?: string
   user?: GhUser
+  head?: { sha?: string }
   additions?: number
   deletions?: number
 }
@@ -269,6 +296,7 @@ export async function fetchPullRequest(ref: PullRequestRef, token: string): Prom
     author: pr.user?.login ?? 'unknown',
     additions: pr.additions ?? 0,
     deletions: pr.deletions ?? 0,
+    ...(pr.head?.sha !== undefined ? { headSha: pr.head.sha } : {}),
     changedFiles: kept.length,
     files: kept,
     comments,
@@ -276,6 +304,53 @@ export async function fetchPullRequest(ref: PullRequestRef, token: string): Prom
     imageUrls,
     mermaidBlocks,
   }
+}
+
+// ---------- New-commit fetching (delta listening) ----------
+
+/** A commit on a PR branch, as consumed by the delta transcript section. */
+export interface PrCommit {
+  sha: string
+  /** First line of the commit message. */
+  message: string
+  /** Committer date, ISO-8601. */
+  date: string
+}
+
+interface GhCommit {
+  sha: string
+  commit?: { message?: string; committer?: { date?: string } }
+}
+
+/** Max commits pulled from the PR commits endpoint across pages. */
+const MAX_PR_COMMITS = 250
+/** Cap on commits returned by fetchNewCommits. */
+const MAX_NEW_COMMITS = 50
+
+/**
+ * Fetch the PR's commits and return only those whose committer date is
+ * strictly after `sinceIso` (ISO-8601 string compare), mapped to
+ * {sha, message (first line), date}, capped at 50. Thrown errors never
+ * contain the token.
+ */
+export async function fetchNewCommits(
+  ref: PullRequestRef,
+  sinceIso: string,
+  token: string,
+): Promise<PrCommit[]> {
+  const commits = await fetchAllPages<GhCommit>(
+    `${API_BASE}/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}/commits`,
+    token,
+    MAX_PR_COMMITS,
+  )
+  return commits
+    .filter((c) => (c.commit?.committer?.date ?? '') > sinceIso)
+    .slice(0, MAX_NEW_COMMITS)
+    .map((c) => ({
+      sha: c.sha,
+      message: (c.commit?.message ?? '').split('\n')[0] ?? '',
+      date: c.commit?.committer?.date ?? '',
+    }))
 }
 
 // ---------- Image fetching ----------

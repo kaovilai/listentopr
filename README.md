@@ -109,6 +109,66 @@ containing one) arrives as `?pr=` / `?text=` / `?url=` query parameters; the
 app prefills the PR input and, once the vault is unlocked, loads and starts
 playing automatically. Routing lives in `src/app.ts`.
 
+## Convenience features
+
+- **Input shorthand** — the Listen box accepts full PR URLs, scheme-less
+  `github.com/owner/repo/pull/123`, and `owner/repo#123`. Unparseable input
+  shows a clear error instead of failing silently.
+- **Transcript cache** — fully generated transcripts are stored locally in
+  IndexedDB (non-secret data; keys stay in the encrypted vault) keyed by PR
+  head SHA. Re-listening to an unchanged PR loads instantly
+  ("Loaded from cache") with no LLM call.
+- **What's New delta** — when the PR head has moved since your last cached
+  listen, the app fetches the commits pushed since your last listen, builds a
+  short "What's New" section from them (single LLM call, previous summary as
+  context), and plays it before the cached transcript.
+- **Resume** — the listening position is saved while playing (throttled to one
+  write per 2 s) and restored on the next load of the same PR
+  ("Resumed at section N, sentence M"). Finishing a PR clears it.
+- **Queue** — "Add to queue" parks the PR in the input box for later (FIFO,
+  with a removable queue list). When a transcript finishes naturally, the next
+  queued PR loads and plays automatically ("Up next: …").
+- **Scrubber** — a position bar over the sentence queue with estimated time
+  ("m:ss of m:ss", words / 150 wpm). Click or drag to seek; keyboard arrows on
+  the bar seek too.
+- **Section TOC** — a clickable list of section titles: a sticky side pane on
+  wide screens, a collapsible dropdown on narrow ones. Clicking jumps to the
+  section's first sentence; clicking any sentence in the transcript seeks
+  there as well.
+- **Sleep timer** — off/10/20/30/60-minute presets. On expiry playback pauses
+  and the status says so; the remaining time is shown next to the control.
+- **Media session** — OS media keys / lock-screen controls (play, pause,
+  next/previous track, seek) and metadata (PR title, "ListenToPR") on devices
+  with `navigator.mediaSession`.
+- **Keyboard shortcuts** — Space toggle play/pause, ArrowLeft/Right skip
+  sentence, ArrowUp/Down (or j/k) skip section, s stop. Ignored while typing
+  in a form field.
+- **Pitch** — a 0.5–2.0 pitch select next to the voice selector, persisted
+  with the other TTS prefs.
+- **Export/share** — "Copy transcript" (async clipboard with an
+  execCommand fallback), "Download .txt" (Blob download named after the PR),
+  and "Share" via the Web Share API where available.
+- **Theme** — a light/dark toggle in the header, persisted in
+  `listentopr.theme` (localStorage), dark by default. All theming lives in
+  `styles.css` variables; no inline styles.
+
+### iOS Shortcut recipe
+
+You can send a PR straight from the GitHub app or Safari into ListenToPR with
+a Shortcut:
+
+1. Open the **Shortcuts** app and create a new shortcut.
+2. Add the **"Receive input from Share Sheet"** action; set the input type to
+   **URL**.
+3. Add the **"Open URLs"** action with
+   `https://github.tig.pw/listentopr/?pr=[Shortcut Input]`.
+4. Name the shortcut (e.g. "Listen to PR").
+
+The same `?pr=<url>` query parameter works from any app that can open a URL,
+not just iOS — the app parses and auto-loads it on launch. Note that
+share-sheet delivery of the URL requires the PWA to be installed to the home
+screen.
+
 ## DVC sign-off matrix
 
 | Criterion | Where implemented |

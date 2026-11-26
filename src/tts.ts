@@ -1,6 +1,13 @@
 // speechSynthesis controller (DVC section 3).
 // Everything flows through injectable deps so tests need no globals.
-import type { Transcript, TranscriptSection, TtsController, TtsPrefs, TtsState } from './types'
+import type {
+  Transcript,
+  TranscriptSection,
+  TtsController,
+  TtsPrefs,
+  TtsProgress,
+  TtsState,
+} from './types'
 
 export interface SpeechSynthesisVoiceLike {
   name: string
@@ -10,6 +17,7 @@ export interface SpeechSynthesisVoiceLike {
 export interface SpeechSynthesisUtteranceLike {
   text: string
   rate?: number
+  pitch?: number
   voice?: SpeechSynthesisVoiceLike | null
   onend?: (() => void) | null
   onerror?: ((event: unknown) => void) | null
@@ -43,6 +51,7 @@ const PREFS_KEY = 'listentopr.tts.prefs'
 class NoopUtterance implements SpeechSynthesisUtteranceLike {
   text: string
   rate = 1
+  pitch = 1
   voice: SpeechSynthesisVoiceLike | null = null
   onend: (() => void) | null = null
   onerror: ((event: unknown) => void) | null = null
@@ -98,6 +107,15 @@ function clampRate(rate: number): number {
   return Math.min(2.0, Math.max(0.8, rate))
 }
 
+function clampPitch(pitch: number): number {
+  return Math.min(2.0, Math.max(0.5, pitch))
+}
+
+/** Words in a sentence; whitespace-separated, empties dropped. */
+function wordCount(text: string): number {
+  return text.split(/\s+/).filter(Boolean).length
+}
+
 interface QueueItem {
   sectionIndex: number
   sentenceIndex: number
@@ -117,6 +135,7 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
   /** Bumped on every speak/jump/stop; stale utterance events are dropped. */
   let generation = 0
   let rate = 1
+  let pitch = 1
   let voiceName: string | null = null
 
   function voiceAvailable(name: string): boolean {
@@ -133,8 +152,10 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
     if (raw !== null) {
       const parsed: unknown = JSON.parse(raw)
       if (typeof parsed === 'object' && parsed !== null) {
-        const p = parsed as { rate?: unknown; voiceName?: unknown }
+        const p = parsed as { rate?: unknown; pitch?: unknown; voiceName?: unknown }
         if (typeof p.rate === 'number' && Number.isFinite(p.rate)) rate = clampRate(p.rate)
+        // Legacy prefs stored before pitch existed have no field -> keep 1.
+        if (typeof p.pitch === 'number' && Number.isFinite(p.pitch)) pitch = clampPitch(p.pitch)
         if (typeof p.voiceName === 'string') voiceName = p.voiceName
       }
     }
@@ -154,7 +175,7 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
   }
 
   function persistPrefs(): void {
-    const prefs: TtsPrefs = { voiceName, rate }
+    const prefs: TtsPrefs = { voiceName, rate, pitch }
     try {
       d.localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
     } catch {
@@ -220,6 +241,7 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
     const gen = generation
     const u = new d.SpeechSynthesisUtterance(item.text)
     u.rate = rate
+    u.pitch = pitch
     const voice = resolveVoice()
     if (voice !== null) u.voice = voice
     u.onend = () => {
@@ -346,6 +368,12 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
       jumpTo(idx + delta)
     },
 
+    seekTo(sentenceIndex: number): void {
+      // jumpTo clamps to 0..queue.length-1, cancels the live utterance and
+      // resumes speaking only if playback was live (same path as skip()).
+      jumpTo(sentenceIndex)
+    },
+
     skipSection(delta: 1 | -1): void {
       if (queue.length === 0) return
       const current = queue[idx] ?? queue[0]
@@ -362,6 +390,11 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
 
     setRate(newRate: number): void {
       rate = clampRate(newRate)
+      persistPrefs()
+    },
+
+    setPitch(newPitch: number): void {
+      pitch = clampPitch(newPitch)
       persistPrefs()
     },
 
@@ -385,7 +418,25 @@ export function createTtsController(deps: Partial<TtsControllerDeps> = {}): TtsC
     },
 
     getPrefs(): TtsPrefs {
-      return { voiceName, rate }
+      return { voiceName, rate, pitch }
+    },
+
+    getProgress(): TtsProgress {
+      // Words / 150 wpm -> seconds.
+      const SECONDS_PER_WORD = 60 / 150
+      let wordsUpToCurrent = 0
+      for (let i = 0; i <= idx && i < queue.length; i++) {
+        const item = queue[i]
+        if (item !== undefined) wordsUpToCurrent += wordCount(item.text)
+      }
+      let totalWords = 0
+      for (const item of queue) totalWords += wordCount(item.text)
+      return {
+        sentenceIndex: idx,
+        totalSentences: queue.length,
+        estimatedSeconds: wordsUpToCurrent * SECONDS_PER_WORD,
+        totalEstimatedSeconds: totalWords * SECONDS_PER_WORD,
+      }
     },
 
     state(): TtsState {

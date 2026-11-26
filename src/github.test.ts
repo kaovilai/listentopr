@@ -4,9 +4,11 @@ import {
   extractImageUrls,
   extractMermaidBlocks,
   fetchImageAsDataUrl,
+  fetchNewCommits,
   fetchPullRequest,
   filterGeneratedFiles,
   findPrUrl,
+  parsePrInput,
   parsePrUrl,
 } from './github'
 import type { PrFile } from './types'
@@ -119,6 +121,86 @@ describe('findPrUrl', () => {
 
   it('returns null when text has no PR URL', () => {
     expect(findPrUrl('no links here https://example.com/x')).toBeNull()
+  })
+})
+
+// ---------- parsePrInput ----------
+
+describe('parsePrInput', () => {
+  it('accepts everything parsePrUrl accepts', () => {
+    expect(parsePrInput('https://github.com/octocat/hello/pull/42')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+    expect(parsePrInput('https://github.com/octocat/hello/pull/42/files?diff=split#top')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+    expect(parsePrInput('https://GITHUB.COM/octocat/hello/pull/42/')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+  })
+
+  it('parses scheme-less github.com URLs, host case-insensitive', () => {
+    expect(parsePrInput('github.com/octocat/hello/pull/42')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+    expect(parsePrInput('GitHub.Com/octocat/hello/pull/42/files')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+    expect(parsePrInput('github.com/octocat/hello/pull/42?diff=split')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+  })
+
+  it('parses owner/repo#123 shorthand', () => {
+    expect(parsePrInput('octocat/hello#42')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+    expect(parsePrInput('my-org.my-sub/my.repo.v2#123456')).toEqual({
+      owner: 'my-org.my-sub',
+      repo: 'my.repo.v2',
+      number: 123456,
+    })
+  })
+
+  it('trims surrounding whitespace', () => {
+    expect(parsePrInput('  octocat/hello#42 \n')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+    expect(parsePrInput('\tgithub.com/octocat/hello/pull/42  ')).toEqual({
+      owner: 'octocat',
+      repo: 'hello',
+      number: 42,
+    })
+  })
+
+  it('rejects garbage and non-github input', () => {
+    expect(parsePrInput('hello world')).toBeNull()
+    expect(parsePrInput('octocat/hello')).toBeNull()
+    expect(parsePrInput('octocat/hello#abc')).toBeNull()
+    expect(parsePrInput('#42')).toBeNull()
+    expect(parsePrInput('octocat/hello#42#43')).toBeNull()
+    expect(parsePrInput('https://gitlab.com/octocat/hello/pull/42')).toBeNull()
+    expect(parsePrInput('gitlab.com/octocat/hello/pull/42')).toBeNull()
+    expect(parsePrInput('github.com/octocat/hello/issues/42')).toBeNull()
+    expect(parsePrInput('https://example.com/octocat/hello#42')).toBeNull()
+    expect(parsePrInput('')).toBeNull()
+    expect(parsePrInput('   ')).toBeNull()
   })
 })
 
@@ -239,6 +321,7 @@ describe('fetchPullRequest', () => {
         title: 'Add feature',
         body: 'Fixes #1\n\n![shot](https://github.com/user-attachments/assets/a1.png)',
         user: { login: 'octocat' },
+        head: { sha: 'abc123def4567abc8def' },
         additions: 10,
         deletions: 2,
       }),
@@ -274,6 +357,7 @@ describe('fetchPullRequest', () => {
     expect(data.author).toBe('octocat')
     expect(data.additions).toBe(10)
     expect(data.deletions).toBe(2)
+    expect(data.headSha).toBe('abc123def4567abc8def')
     // generated files filtered out, counts reflect the kept list
     expect(data.files.map((x) => x.filename)).toEqual(['src/a.ts', 'src/b.ts'])
     expect(data.changedFiles).toBe(2)
@@ -325,6 +409,8 @@ describe('fetchPullRequest', () => {
 
     const data = await fetchPullRequest(REF, TOKEN)
     expect(data.files).toHaveLength(150)
+    // no head.sha in the PR payload -> headSha absent
+    expect(data.headSha).toBeUndefined()
     expect(fetchMock).toHaveBeenCalledWith(
       `${filesBase}?per_page=100&page=2`,
       expect.objectContaining({ headers: expect.objectContaining({ Authorization: `Bearer ${TOKEN}` }) }),
@@ -406,6 +492,77 @@ describe('fetchPullRequest', () => {
     const msg = (err as Error).message
     expect(msg).not.toContain(TOKEN)
     expect(msg).toContain('[REDACTED]')
+  })
+})
+
+// ---------- fetchNewCommits ----------
+
+describe('fetchNewCommits', () => {
+  const COMMITS_BASE = 'https://api.github.com/repos/octo/repo/pulls/7/commits'
+
+  function ghCommit(sha: string, message: string, date: string): Record<string, unknown> {
+    return { sha, commit: { message, committer: { date } } }
+  }
+
+  function stubCommits(body: unknown): void {
+    fetchMock.mockImplementation((url: string) => {
+      if (url === `${COMMITS_BASE}?${FILES_Q}`) return Promise.resolve(jsonRes(body))
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+  }
+
+  it('returns only commits after sinceIso, mapped to first-line messages, with auth headers', async () => {
+    stubCommits([
+      ghCommit('old0001', 'old commit before cutoff\n\nbody', '2026-11-01T00:00:00Z'),
+      ghCommit('new0001', 'fix: handle empty input\n\nlong body here\n\nfooter', '2026-11-20T10:00:00Z'),
+      ghCommit('new0002', 'feat: add delta listening', '2026-11-21T10:00:00Z'),
+    ])
+
+    const commits = await fetchNewCommits(REF, '2026-11-19T00:00:00Z', TOKEN)
+
+    expect(commits).toEqual([
+      { sha: 'new0001', message: 'fix: handle empty input', date: '2026-11-20T10:00:00Z' },
+      { sha: 'new0002', message: 'feat: add delta listening', date: '2026-11-21T10:00:00Z' },
+    ])
+    const init = fetchMock.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`)
+    expect(init.headers.Accept).toBe('application/vnd.github+json')
+  })
+
+  it('uses strict ISO string comparison on the committer date', async () => {
+    stubCommits([
+      ghCommit('edge1', 'exactly at cutoff', '2026-11-19T00:00:00Z'),
+      ghCommit('edge2', 'one second after', '2026-11-19T00:00:01Z'),
+    ])
+
+    const commits = await fetchNewCommits(REF, '2026-11-19T00:00:00Z', TOKEN)
+    expect(commits.map((c) => c.sha)).toEqual(['edge2'])
+  })
+
+  it('caps the result at 50 commits', async () => {
+    stubCommits(
+      Array.from({ length: 60 }, (_, i) => ghCommit(`cap${i}`, `commit ${i}`, '2026-11-25T00:00:00Z')),
+    )
+
+    const commits = await fetchNewCommits(REF, '2026-11-01T00:00:00Z', TOKEN)
+    expect(commits).toHaveLength(50)
+    expect(commits[0]!.sha).toBe('cap0')
+    expect(commits[49]!.sha).toBe('cap49')
+  })
+
+  it('returns an empty list when every commit is older than sinceIso', async () => {
+    stubCommits([ghCommit('o1', 'old', '2026-10-01T00:00:00Z')])
+    expect(await fetchNewCommits(REF, '2026-11-01T00:00:00Z', TOKEN)).toEqual([])
+  })
+
+  it('throws a sanitized error on HTTP failure', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url === `${COMMITS_BASE}?${FILES_Q}`) {
+        return Promise.resolve(jsonRes({ message: 'Not Found' }, { status: 404 }))
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+    await expect(fetchNewCommits(REF, '2026-11-01T00:00:00Z', TOKEN)).rejects.toThrow(/404/)
   })
 })
 

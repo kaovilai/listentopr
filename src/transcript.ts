@@ -1,5 +1,6 @@
 // Transcript pipeline (DVC section 2): turn PR data into a speakable transcript.
 import { chat } from './llm'
+import type { PrCommit } from './github'
 import type {
   LlmConfig,
   LlmMessage,
@@ -321,6 +322,82 @@ export async function buildTranscript(
   ]
   const raw = await chat(config, messages)
   return materializeTranscript(raw, pr)
+}
+
+// ---------------------------------------------------------------------------
+// Delta section (what's new since a previously heard summary)
+// ---------------------------------------------------------------------------
+
+export interface DeltaSectionOptions {
+  /** Injectable chat fn (tests). Defaults to the real LLM client. */
+  chat?: typeof chat
+}
+
+const DELTA_SYSTEM_PROMPT = [
+  'You are a senior software engineer speaking aloud to a colleague who is listening, not reading.',
+  'The listener already heard a summary of this pull request earlier; the previously heard summary is provided.',
+  'They now want ONLY what changed since that summary, not a repeat of the whole pull request.',
+  'Respond with STRICT JSON only: no markdown fences, no prose outside the JSON.',
+  'JSON shape: {"title": string, "sentences": string[]}.',
+  'title: a short heading for this update.',
+  'sentences: the spoken content; never quote code verbatim.',
+  'Every sentence must be self-contained and natural when read aloud by text-to-speech.',
+].join('\n')
+
+function deltaUserPrompt(
+  pr: PullRequestData,
+  newCommits: PrCommit[],
+  previousSummary: string,
+): string {
+  const lines: string[] = [
+    prHeader(pr),
+    '',
+    '## Previously heard summary (do not repeat its content)',
+    truncate(previousSummary || '(none)', 4000),
+    '',
+    '## New commits since that summary (explain what these change)',
+  ]
+  for (const c of newCommits) {
+    lines.push(`- ${truncate(c.message, 400)} (committed ${c.date})`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Build the "What's New" section for a listener who already heard a summary
+ * of this PR: one LLM call covering only the commits pushed since. Uses the
+ * same sanitizeLine/splitSentences path as the other builders, and tolerates
+ * non-JSON replies by narrating the raw text.
+ */
+export async function buildDeltaSection(
+  config: LlmConfig,
+  pr: PullRequestData,
+  newCommits: PrCommit[],
+  previousSummary: string,
+  opts: DeltaSectionOptions = {},
+): Promise<TranscriptSection> {
+  const chatFn = opts.chat ?? chat
+  const messages: LlmMessage[] = [
+    { role: 'system', text: DELTA_SYSTEM_PROMPT },
+    { role: 'user', text: deltaUserPrompt(pr, newCommits, previousSummary) },
+  ]
+  const raw = await chatFn(config, messages)
+  const parsed = extractJsonObject(raw)
+  if (parsed !== undefined && isValidStreamSection(parsed)) {
+    const sentences = parsed.sentences
+      .flatMap((sentence) => splitSentences(sanitizeLine(sentence)))
+      .filter((sentence) => sentence.length > 0)
+    if (sentences.length > 0) {
+      return { id: 'whats-new', title: "What's New", sentences }
+    }
+  }
+  // Fallback: treat the raw reply as narrated text.
+  const sentences = splitSentences(sanitizeLine(raw)).filter((s) => s.length > 0)
+  return {
+    id: 'whats-new',
+    title: "What's New",
+    sentences: sentences.length > 0 ? sentences : ['[unpronounceable content]'],
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { chat, LlmError } from './llm'
 import type { ChatOptions } from './llm'
-import { buildTranscript, createTranscriptStream, sanitizeLine, splitSentences } from './transcript'
+import type { PrCommit } from './github'
+import { buildDeltaSection, buildTranscript, createTranscriptStream, sanitizeLine, splitSentences } from './transcript'
 import type {
   LlmConfig,
   LlmMessage,
@@ -451,6 +452,89 @@ function recordChat(
 }
 
 const defaultResponder = (_call: RecordedCall, i: number): string => sectionJson(i)
+
+// ---------------------------------------------------------------------------
+// buildDeltaSection
+// ---------------------------------------------------------------------------
+
+const DELTA_COMMITS: PrCommit[] = [
+  { sha: 'new0001', message: 'fix: handle empty input', date: '2026-11-20T10:00:00Z' },
+  { sha: 'new0002', message: 'feat: add delta listening', date: '2026-11-21T10:00:00Z' },
+]
+
+describe('buildDeltaSection', () => {
+  it('makes one call whose prompt carries the previous summary and commit messages, not the full diff', async () => {
+    const { calls, chat: fake } = recordChat(() =>
+      JSON.stringify({ title: 'ignored title', sentences: ['Fresh work landed.'] }),
+    )
+    const pr = makePr()
+    await buildDeltaSection(config, pr, DELTA_COMMITS, 'The listener already heard about the caching layer.', {
+      chat: fake,
+    })
+
+    expect(calls).toHaveLength(1)
+    const [system, user] = calls[0]!.messages
+    expect(system!.role).toBe('system')
+    expect(system!.text).toContain('already heard')
+    expect(system!.text).toContain('STRICT JSON')
+    expect(user!.role).toBe('user')
+    // PR title + ref
+    expect(user!.text).toContain('acme/widget#7')
+    expect(user!.text).toContain('Add caching layer')
+    // previous summary carried into the prompt
+    expect(user!.text).toContain('The listener already heard about the caching layer.')
+    // new commit messages carried into the prompt
+    expect(user!.text).toContain('fix: handle empty input')
+    expect(user!.text).toContain('feat: add delta listening')
+    // no stale full diff: patches, PR body, review feedback all absent
+    expect(user!.text).not.toContain('export const cache')
+    expect(user!.text).not.toContain('Adds a cache')
+    expect(user!.text).not.toContain('Please add tests for eviction')
+    expect(user!.text).not.toContain('Race condition')
+    // no images attached to a delta call
+    expect(user!.images).toBeUndefined()
+  })
+
+  it('returns a whats-new section with sanitized, split sentences from a JSON reply', async () => {
+    const { chat: fake } = recordChat(() =>
+      JSON.stringify({
+        title: 'Ignored heading',
+        sentences: ['The empty input crash is fixed.', 'See https://example.com/fix for details.'],
+      }),
+    )
+    const section = await buildDeltaSection(config, makePr(), DELTA_COMMITS, 'previous summary', {
+      chat: fake,
+    })
+    expect(section.id).toBe('whats-new')
+    expect(section.title).toBe("What's New")
+    expect(section.sentences).toEqual([
+      'The empty input crash is fixed.',
+      'See example.com for details.',
+    ])
+  })
+
+  it('narrates a non-JSON reply through the sanitize/split path', async () => {
+    const { chat: fake } = recordChat(() => 'Not JSON at all. It still describes the new commits.')
+    const section = await buildDeltaSection(config, makePr(), DELTA_COMMITS, 'previous summary', {
+      chat: fake,
+    })
+    expect(section.id).toBe('whats-new')
+    expect(section.title).toBe("What's New")
+    expect(section.sentences).toEqual([
+      'Not JSON at all.',
+      'It still describes the new commits.',
+    ])
+  })
+
+  it('falls back to a placeholder when the reply has no speakable content', async () => {
+    const { chat: fake } = recordChat(() => '```\n!!!\n```')
+    const section = await buildDeltaSection(config, makePr(), DELTA_COMMITS, 'previous summary', {
+      chat: fake,
+    })
+    expect(section.id).toBe('whats-new')
+    expect(section.sentences).toEqual(['[unpronounceable content]'])
+  })
+})
 
 async function drain(stream: {
   next(): Promise<TranscriptSection | null>

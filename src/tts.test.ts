@@ -8,6 +8,7 @@ import type { Transcript, TranscriptSection, TtsState } from './types'
 class FakeUtterance {
   text: string
   rate = 1
+  pitch = 1
   voice: { name: string } | null = null
   onend: (() => void) | null = null
   onerror: ((event: unknown) => void) | null = null
@@ -382,24 +383,24 @@ describe('prefs persistence', () => {
     a.setRate(1.5)
     a.setVoice('Alex')
     const b = makeController(env)
-    expect(b.getPrefs()).toEqual({ voiceName: 'Alex', rate: 1.5 })
+    expect(b.getPrefs()).toEqual({ voiceName: 'Alex', rate: 1.5, pitch: 1 })
   })
 
   it('corrupted stored JSON falls back to defaults without throwing', () => {
     const env = makeEnv()
     env.store.set('listentopr.tts.prefs', '{not valid json')
     const c = makeController(env)
-    expect(c.getPrefs()).toEqual({ voiceName: null, rate: 1 })
+    expect(c.getPrefs()).toEqual({ voiceName: null, rate: 1, pitch: 1 })
     env.store.set('listentopr.tts.prefs', '{"rate":"fast","voiceName":42}')
     const c2 = makeController(env)
-    expect(c2.getPrefs()).toEqual({ voiceName: null, rate: 1 })
+    expect(c2.getPrefs()).toEqual({ voiceName: null, rate: 1, pitch: 1 })
   })
 
   it('stored voice unavailable on this synth falls back to null, rate kept', () => {
     const env = makeEnv([{ name: 'Alex' }])
     env.store.set('listentopr.tts.prefs', JSON.stringify({ voiceName: 'Gone', rate: 1.5 }))
     const c = makeController(env)
-    expect(c.getPrefs()).toEqual({ voiceName: null, rate: 1.5 })
+    expect(c.getPrefs()).toEqual({ voiceName: null, rate: 1.5, pitch: 1 })
   })
 
   it('stored voice is kept (not nulled) while the voice list has not loaded', () => {
@@ -407,7 +408,7 @@ describe('prefs persistence', () => {
     const env = makeEnv(voices)
     env.store.set('listentopr.tts.prefs', JSON.stringify({ voiceName: 'Alex', rate: 1.5 }))
     const c = makeController(env)
-    expect(c.getPrefs()).toEqual({ voiceName: 'Alex', rate: 1.5 })
+    expect(c.getPrefs()).toEqual({ voiceName: 'Alex', rate: 1.5, pitch: 1 })
     // A setVoice of the persisted name before voices load must not wipe it.
     c.setVoice('Alex')
     expect(c.getPrefs().voiceName).toBe('Alex')
@@ -666,5 +667,225 @@ describe('appendSections', () => {
     expect(env.spoken).toHaveLength(1)
     fireEnd(last(env.spoken))
     expect(env.spoken[1]!.text).toBe('A two.')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// seekTo
+// ---------------------------------------------------------------------------
+
+describe('seekTo', () => {
+  it('jumps to an absolute sentence index while playing and keeps speaking', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    const callsBefore = env.calls.length
+    c.seekTo(3) // (2,0) 'C one.'
+    expect(c.state()).toMatchObject({ playing: true, sectionIndex: 2, sentenceIndex: 0 })
+    expect(last(env.spoken).text).toBe('C one.')
+    const around = env.calls.slice(callsBefore)
+    expect(around).toContain('cancel')
+    expect(around.indexOf('resume')).toBeGreaterThan(around.indexOf('cancel'))
+    // Chaining continues from the seek target.
+    fireEnd(last(env.spoken))
+    expect(last(env.spoken).text).toBe('C two.')
+  })
+
+  it('moves position without speaking when stopped', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.seekTo(4) // (2,1) 'C two.'
+    expect(env.spoken.length).toBe(0)
+    expect(c.state()).toMatchObject({ playing: false, sectionIndex: 2, sentenceIndex: 1 })
+    c.play()
+    expect(env.spoken[0]!.text).toBe('C two.')
+  })
+
+  it('clamps to the queue bounds', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.seekTo(-5)
+    expect(c.state()).toMatchObject({ sectionIndex: 0, sentenceIndex: 0 })
+    c.seekTo(100)
+    expect(c.state()).toMatchObject({ sectionIndex: 2, sentenceIndex: 2 })
+  })
+
+  it('is a no-op on an empty queue', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load({ title: 'empty', sections: [] })
+    c.seekTo(3)
+    expect(env.spoken.length).toBe(0)
+    expect(c.state()).toEqual({
+      playing: false,
+      paused: false,
+      sectionIndex: 0,
+      sentenceIndex: 0,
+    })
+  })
+
+  it('late onend from the utterance cancelled by seekTo is ignored', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(transcript)
+    c.play()
+    const stale = env.spoken[0]!
+    c.seekTo(2) // 'B one.'
+    fireEnd(stale)
+    expect(env.spoken).toHaveLength(2)
+    expect(c.state()).toMatchObject({ playing: true, sectionIndex: 1, sentenceIndex: 0 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// setPitch
+// ---------------------------------------------------------------------------
+
+describe('setPitch', () => {
+  it('clamps to 0.5..2.0 and applies to utterances spoken afterwards', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.setPitch(0.1)
+    expect(c.getPrefs().pitch).toBe(0.5)
+    c.setPitch(9)
+    expect(c.getPrefs().pitch).toBe(2)
+    c.setPitch(1.3)
+    c.load(transcript)
+    c.play()
+    expect(env.spoken[0]!.pitch).toBe(1.3)
+    c.setPitch(0.6)
+    fireEnd(env.spoken[0]!)
+    expect(env.spoken[1]!.pitch).toBe(0.6)
+  })
+
+  it('persists pitch; a new controller on the same storage reloads it', () => {
+    const env = makeEnv()
+    const a = makeController(env)
+    a.setPitch(1.6)
+    expect(JSON.parse(env.store.get('listentopr.tts.prefs')!).pitch).toBe(1.6)
+    const b = makeController(env)
+    expect(b.getPrefs()).toEqual({ voiceName: null, rate: 1, pitch: 1.6 })
+  })
+
+  it('legacy prefs without pitch default to 1', () => {
+    const env = makeEnv()
+    env.store.set('listentopr.tts.prefs', JSON.stringify({ voiceName: null, rate: 1.5 }))
+    const c = makeController(env)
+    expect(c.getPrefs()).toEqual({ voiceName: null, rate: 1.5, pitch: 1 })
+  })
+
+  it('out-of-range stored pitch is clamped on load', () => {
+    const env = makeEnv()
+    env.store.set('listentopr.tts.prefs', JSON.stringify({ voiceName: null, rate: 1, pitch: 42 }))
+    const c = makeController(env)
+    expect(c.getPrefs().pitch).toBe(2)
+  })
+
+  it('pitch, rate and voice co-exist on the same utterance', () => {
+    const env = makeEnv([{ name: 'Alex' }, { name: 'Sam' }])
+    const c = makeController(env)
+    c.setRate(1.4)
+    c.setPitch(1.7)
+    c.setVoice('Sam')
+    c.load(transcript)
+    c.play()
+    expect(env.spoken[0]!.rate).toBe(1.4)
+    expect(env.spoken[0]!.pitch).toBe(1.7)
+    expect(env.spoken[0]!.voice?.name).toBe('Sam')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getProgress
+// ---------------------------------------------------------------------------
+
+describe('getProgress', () => {
+  // Non-uniform word counts: 4 + 1 + 3 words.
+  const words: Transcript = {
+    title: 'PR 2',
+    sections: [
+      { id: 'w0', title: 'A', sentences: ['one two three four', 'five'] },
+      { id: 'w1', title: 'B', sentences: ['six seven eight'] },
+    ],
+  }
+  // 150 wpm -> 0.4 s per word.
+
+  it('empty transcript reports zeros', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load({ title: 'empty', sections: [] })
+    expect(c.getProgress()).toEqual({
+      sentenceIndex: 0,
+      totalSentences: 0,
+      estimatedSeconds: 0,
+      totalEstimatedSeconds: 0,
+    })
+  })
+
+  it('counts words up to and including the current sentence', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(words)
+    expect(c.getProgress()).toEqual({
+      sentenceIndex: 0,
+      totalSentences: 3,
+      estimatedSeconds: 1.6, // 4 words
+      totalEstimatedSeconds: 3.2, // 8 words
+    })
+    c.play()
+    fireEnd(env.spoken[0]!)
+    expect(c.getProgress()).toEqual({
+      sentenceIndex: 1,
+      totalSentences: 3,
+      estimatedSeconds: 2, // 4 + 1 words
+      totalEstimatedSeconds: 3.2,
+    })
+    fireEnd(env.spoken[1]!)
+    expect(c.getProgress()).toEqual({
+      sentenceIndex: 2,
+      totalSentences: 3,
+      estimatedSeconds: 3.2, // all words
+      totalEstimatedSeconds: 3.2,
+    })
+  })
+
+  it('reflects seekTo position', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(words)
+    c.seekTo(2)
+    expect(c.getProgress().sentenceIndex).toBe(2)
+    expect(c.getProgress().estimatedSeconds).toBe(3.2)
+  })
+
+  it('includes appended sections in the totals', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(words)
+    c.appendSections([{ id: 'w2', title: 'C', sentences: ['nine ten'] }])
+    expect(c.getProgress()).toEqual({
+      sentenceIndex: 0,
+      totalSentences: 4,
+      estimatedSeconds: 1.6,
+      totalEstimatedSeconds: 4, // 10 words
+    })
+  })
+
+  it('progress stays coherent after playback finishes', () => {
+    const env = makeEnv()
+    const c = makeController(env)
+    c.load(words)
+    c.play()
+    let guard = 0
+    while (c.state().playing && guard++ < 10) fireEnd(last(env.spoken))
+    expect(c.getProgress()).toEqual({
+      sentenceIndex: 2,
+      totalSentences: 3,
+      estimatedSeconds: 3.2,
+      totalEstimatedSeconds: 3.2,
+    })
   })
 })

@@ -33,6 +33,8 @@ export interface PullRequestData {
   title: string
   body: string
   author: string
+  /** Head commit SHA of the PR branch, when the API provides it. */
+  headSha?: string
   additions: number
   deletions: number
   changedFiles: number
@@ -92,12 +94,23 @@ export interface TtsState {
 export interface TtsPrefs {
   voiceName: string | null
   rate: number
+  pitch: number
+}
+
+/** Playback position + spoken-time estimate (words / 150 wpm). */
+export interface TtsProgress {
+  sentenceIndex: number
+  totalSentences: number
+  estimatedSeconds: number
+  totalEstimatedSeconds: number
 }
 
 export interface TtsController {
   load(transcript: Transcript): void
   /** Append sections to an already-loaded transcript (streaming). */
   appendSections(sections: TranscriptSection[]): void
+  /** Jump to an absolute sentence index (clamped). */
+  seekTo(sentenceIndex: number): void
   play(): void
   pause(): void
   resume(): void
@@ -107,8 +120,10 @@ export interface TtsController {
   /** Skip to next/previous section. */
   skipSection(delta: 1 | -1): void
   setRate(rate: number): void
+  setPitch(pitch: number): void
   setVoice(voiceName: string): void
   getPrefs(): TtsPrefs
+  getProgress(): TtsProgress
   state(): TtsState
   onChange(cb: (state: TtsState, currentSentence: string | null) => void): () => void
 }

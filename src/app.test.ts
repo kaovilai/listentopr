@@ -176,3 +176,139 @@ describe('readProvider', () => {
     }
   })
 })
+
+describe('shouldBuildDelta', () => {
+  it('is false without a cached sha or a current head sha', () => {
+    expect(app.shouldBuildDelta(null, 'abc')).toBe(false)
+    expect(app.shouldBuildDelta('abc', null)).toBe(false)
+    expect(app.shouldBuildDelta('abc', undefined)).toBe(false)
+    expect(app.shouldBuildDelta(null, null)).toBe(false)
+  })
+
+  it('is false when the cached sha matches the current head', () => {
+    expect(app.shouldBuildDelta('abc', 'abc')).toBe(false)
+  })
+
+  it('is true when the head moved past the cached sha', () => {
+    expect(app.shouldBuildDelta('abc', 'def')).toBe(true)
+  })
+})
+
+describe('seekIndexFromRatio', () => {
+  it('maps a scrubber ratio onto a sentence queue index', () => {
+    expect(app.seekIndexFromRatio(0, 10)).toBe(0)
+    expect(app.seekIndexFromRatio(0.5, 10)).toBe(5)
+    // the last sentence is the end of the bar, not one past it
+    expect(app.seekIndexFromRatio(1, 10)).toBe(9)
+  })
+
+  it('clamps out-of-range ratios and empty queues', () => {
+    expect(app.seekIndexFromRatio(-1, 10)).toBe(0)
+    expect(app.seekIndexFromRatio(2, 10)).toBe(9)
+    expect(app.seekIndexFromRatio(0.5, 0)).toBe(0)
+    expect(app.seekIndexFromRatio(Number.NaN, 10)).toBe(0)
+  })
+})
+
+describe('formatTime', () => {
+  it('formats seconds as m:ss', () => {
+    expect(app.formatTime(0)).toBe('0:00')
+    expect(app.formatTime(9.4)).toBe('0:09')
+    expect(app.formatTime(65)).toBe('1:05')
+    expect(app.formatTime(600)).toBe('10:00')
+  })
+
+  it('tolerates non-finite and negative input', () => {
+    expect(app.formatTime(-5)).toBe('0:00')
+    expect(app.formatTime(Number.NaN)).toBe('0:00')
+    expect(app.formatTime(Number.POSITIVE_INFINITY)).toBe('0:00')
+  })
+})
+
+describe('describeResumePosition', () => {
+  const sections = [
+    section(['a', 'b', 'c']),
+    section(['d', 'e']),
+  ]
+
+  it('labels the 1-based section and sentence at a flat index', () => {
+    expect(app.describeResumePosition(sections, 0)).toBe('section 1, sentence 1')
+    expect(app.describeResumePosition(sections, 3)).toBe('section 2, sentence 1')
+    expect(app.describeResumePosition(sections, 4)).toBe('section 2, sentence 2')
+  })
+
+  it('falls back to a flat sentence label past the end', () => {
+    expect(app.describeResumePosition(sections, 9)).toBe('sentence 10')
+    expect(app.describeResumePosition([], 2)).toBe('sentence 3')
+  })
+})
+
+describe('shouldWriteResume', () => {
+  it('writes at most once per throttle interval', () => {
+    expect(app.shouldWriteResume(0, 0)).toBe(false)
+    expect(app.shouldWriteResume(0, 1999)).toBe(false)
+    expect(app.shouldWriteResume(0, 2000)).toBe(true)
+    expect(app.shouldWriteResume(1000, 2999)).toBe(false)
+    expect(app.shouldWriteResume(1000, 3000)).toBe(true)
+  })
+})
+
+describe('sleepExpireAction', () => {
+  it('pauses while speech is live, even with a hold also pending', () => {
+    expect(app.sleepExpireAction(state({ playing: true, paused: false }), false)).toBe('pause')
+    expect(app.sleepExpireAction(state({ playing: true, paused: false }), true)).toBe('pause')
+  })
+
+  it('stops when a stream hold is pending and nothing is speaking', () => {
+    // Pause is a guarded no-op mid-hold; without a stop the hold pipeline
+    // restarts audio when the in-flight section lands, past the deadline.
+    expect(app.sleepExpireAction(state({ playing: false, paused: false }), true)).toBe('stop')
+  })
+
+  it('does nothing when already paused or idle with no hold', () => {
+    expect(app.sleepExpireAction(state({ playing: true, paused: true }), false)).toBe('none')
+    expect(app.sleepExpireAction(state({ playing: false, paused: false }), false)).toBe('none')
+  })
+})
+
+describe('summarizeTranscript', () => {
+  it('uses the first two spoken sentences as the previous summary', () => {
+    const t = { title: 'T', sections: [section(['one', 'two', 'three']), section(['four'])] }
+    expect(app.summarizeTranscript(t)).toBe('one two')
+  })
+
+  it('handles empty transcripts', () => {
+    expect(app.summarizeTranscript({ title: 'T', sections: [] })).toBe('')
+    expect(app.summarizeTranscript({ title: 'T', sections: [section([])] })).toBe('')
+  })
+})
+
+describe('transcriptToText', () => {
+  it('renders title and sections as plain text', () => {
+    const text = app.transcriptToText('My PR', [section(['a', 'b'])])
+    expect(text).toContain('My PR')
+    expect(text).toContain('## Test')
+    expect(text).toContain('a b')
+  })
+
+  it('ends with a newline and works empty', () => {
+    expect(app.transcriptToText('T', [])).toBe('T\n')
+  })
+})
+
+describe('readTheme', () => {
+  it('defaults to dark when nothing is persisted', () => {
+    storage.delete('listentopr.theme')
+    expect(app.readTheme()).toBe('dark')
+  })
+
+  it('returns the persisted light theme', () => {
+    storage.set('listentopr.theme', 'light')
+    expect(app.readTheme()).toBe('light')
+  })
+
+  it('treats a bogus persisted value as dark', () => {
+    storage.set('listentopr.theme', 'blue')
+    expect(app.readTheme()).toBe('dark')
+  })
+})
