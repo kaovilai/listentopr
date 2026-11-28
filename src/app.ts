@@ -1376,7 +1376,7 @@ function buildSettingsPanel(): HTMLDivElement {
           ? 'LLM API key (optional — uses your GitHub sign-in or PAT)'
           : 'LLM API key',
     )
-    model.input.placeholder = github ? 'openai/gpt-4o' : copilot ? 'gpt-5.6-luna' : ''
+    model.input.placeholder = github ? 'openai/gpt-4o' : copilot ? 'gpt-6-luna' : ''
     endpoint.input.placeholder = copilot
       ? 'default api.githubcopilot.com (Business/Enterprise: api.business.githubcopilot.com)'
       : ''

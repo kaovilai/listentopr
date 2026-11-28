@@ -180,7 +180,7 @@ pasted PAT with a proper OAuth sign-in token:
 **GitHub Copilot** (`provider: copilot`) speaks the OpenAI dialect against
 `https://api.githubcopilot.com` (`/chat/completions`) with the same token as
 a Bearer (sign-in `gho_`, `ghu_`, or a fine-grained `github_pat_` with a
-Copilot entitlement). Model ids look like `gpt-5.6-luna` or
+Copilot entitlement). Model ids look like `gpt-6-luna` or
 `claude-haiku-4.5`; the model and vision-model fields become live pickers
 fed by the Copilot model list, with the same **Custom…**, **Refresh
 models**, and fallback-to-text treatment as the GitHub Models picker. The
