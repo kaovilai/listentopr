@@ -25,6 +25,6 @@
   "isChromeOSOnly": false,
   "isMetaQuest": false,
   "fullScopeUrl": "https://github.tig.pw/listentopr/",
-  "minSdkVersion": 21,
+  "minSdkVersion": 24,
   "signingKey": { "path": "android.keystore", "alias": "listentopr" }
 }
