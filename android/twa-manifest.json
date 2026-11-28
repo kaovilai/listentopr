@@ -18,6 +18,8 @@
   "generatorApp": "bubblewrap-cli",
   "fallbackType": "customtabs",
   "features": {},
+  "enableNotifications": false,
+  "splashScreenFadeOutDuration": 0,
   "alphaDependencies": { "enabled": false },
   "enableSiteSettingsShortcut": true,
   "isChromeOSOnly": false,
