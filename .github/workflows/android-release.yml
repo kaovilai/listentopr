@@ -1,0 +1,79 @@
+name: Android Release
+
+# Builds the TWA APK and publishes it as a GitHub Release, so Obtainium
+# (https://github.com/ImranR98/Obtainium) can install and update the app
+# directly from this repo. Triggered by pushing a v* tag.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install bubblewrap
+        run: npm install -g @bubblewrap/cli
+
+      - name: Configure bubblewrap JDK/SDK paths
+        run: |
+          mkdir -p ~/.bubblewrap
+          printf '{"jdkPath":"%s","androidSdkPath":"/usr/local/lib/android/sdk"}\n' "$JAVA_HOME" > ~/.bubblewrap/config.json
+
+      - name: Inject version from tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          node -e '
+            const fs = require("fs");
+            const p = "android/twa-manifest.json";
+            const m = JSON.parse(fs.readFileSync(p, "utf8"));
+            m.appVersionName = process.argv[1];
+            m.appVersionCode = Number(process.env.GITHUB_RUN_NUMBER);
+            fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n");
+          ' "$TAG"
+
+      - name: Decode signing keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/android.keystore
+          ls -la android/android.keystore
+
+      - name: Generate Android project
+        run: bubblewrap update --skipVersionUpgrade --manifest=android --directory=android/dist
+
+      - name: Build signed APK
+        working-directory: android/dist
+        env:
+          BUBBLEWRAP_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          BUBBLEWRAP_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: bubblewrap build --skipPwaValidation --manifest=.. --signingKeyPath=../android.keystore
+
+      - name: Verify APK signature matches assetlinks
+        working-directory: android/dist
+        run: |
+          BUILD_TOOLS=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
+          "$BUILD_TOOLS/apksigner" verify --print-certs app-release-signed.apk | grep -i 'SHA-256'
+
+      - name: Create GitHub Release with APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cp android/dist/app-release-signed.apk "listentopr-${TAG}.apk"
+          gh release create "$TAG" "listentopr-${TAG}.apk" \
+            --title "ListenToPR $TAG" \
+            --notes "TWA build of https://github.tig.pw/listentopr/ — the app shell wraps the live site, so most updates ship without a new APK. Obtainium users: add https://github.com/kaovilai/listentopr as an app source (GitHub releases)."

@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "dev.tkaovilai.listentopr",
+      "sha256_cert_fingerprints": [
+        "C9:E6:16:57:06:F5:BA:F6:B3:26:31:A1:54:F5:58:59:BE:26:E5:EE:9A:5D:04:02:1F:17:90:62:41:05:CF:9A"
+      ]
+    }
+  }
+]

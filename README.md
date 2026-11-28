@@ -401,3 +401,47 @@ modes (`light` → Light, anything unknown → Auto).
 | Demo transcript, bookmarklet chip, replay, voice preview, file chips, detail toggle, background warning | `src/app.ts`, `src/styles.css` |
 | CSP with build-time LLM endpoint injection | `index.html`, `vite.config.ts` |
 | Tests (544 across 19 files) | `src/*.test.ts` |
+
+## Android (Obtainium) delivery
+
+The app ships as a Trusted Web Activity (TWA) APK published to GitHub
+Releases — no Play Store needed. Obtainium installs and updates it
+straight from this repo.
+
+### Install via Obtainium
+
+1. Install [Obtainium](https://github.com/ImranR98/Obtainium)
+2. Add app → GitHub → `kaovilai/listentopr`
+3. Obtainium tracks the `listentopr-v*.apk` release asset and updates
+   automatically on each new tag
+
+The APK is a thin shell around https://github.tig.pw/listentopr/ — the
+service worker serves the live site, so most improvements land without a
+new APK. Only native-shell changes (icon, package, signing) need a
+re-release: push a `v*` tag and the
+[Android Release workflow](.github/workflows/android-release.yml)
+builds, signs, and publishes.
+
+### URL-bar removal (Digital Asset Links)
+
+`public/.well-known/assetlinks.json` binds the signing certificate to
+`dev.tkaovilai.listentopr`. For full-screen (no URL bar) the file must
+be served at the DOMAIN ROOT — `https://github.tig.pw/.well-known/assetlinks.json`
+— because the app lives under a scoped path. If you control the root,
+copy the file there; until then the TWA falls back to a Chrome
+custom-tab with a URL bar.
+
+### Signing key
+
+The release keystore lives outside this repo (never commit it). Required
+repo secrets:
+
+| Secret | Value |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | `base64 -w0 listentopr.jks` |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore password |
+| `ANDROID_KEY_ALIAS` | `listentopr` |
+| `ANDROID_KEY_PASSWORD` | key password |
+
+Losing the keystore means a new package id — users would have to
+reinstall as a new app. Back it up.
