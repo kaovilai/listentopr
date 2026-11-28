@@ -906,3 +906,15 @@ a.file-chip:hover {
     scroll-behavior: auto !important;
   }
 }
+
+/* Inline sign-in error + OAuth creation hint inside the settings card —
+   the shared status banner does not exist in the settings panel. */
+.signin-err {
+  color: var(--danger, #f85149);
+  margin: 0.5rem 0 0;
+  overflow-wrap: anywhere;
+}
+.signin-hint {
+  margin: 0.25rem 0 0.5rem;
+  overflow-wrap: anywhere;
+}

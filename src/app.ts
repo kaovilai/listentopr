@@ -1235,6 +1235,30 @@ function buildSettingsPanel(): HTMLDivElement {
   // fetching and the Copilot provider.
   const clientId = labeledInput('GitHub OAuth app client ID (for sign-in)', 'text', readOAuthClientId())
   clientId.input.placeholder = 'from Settings > Developer settings > OAuth Apps'
+  // Inline error INSIDE the settings card: setStatus() no-ops here (no
+  // status element exists in the settings panel), which made a missing
+  // client id look like a dead button on mobile.
+  const signinErr = el('p', 'signin-err')
+  signinErr.hidden = true
+  signinErr.setAttribute('role', 'alert')
+  const createOauthLink = el('a', 'device-link', 'Create an OAuth app on GitHub')
+  createOauthLink.href = 'https://github.com/settings/applications/new'
+  createOauthLink.target = '_blank'
+  createOauthLink.rel = 'noopener noreferrer'
+  const createOauthHint = el(
+    'p',
+    'muted signin-hint',
+    'No app yet? Use the link above (name it anything, homepage https://github.tig.pw/listentopr/, callback URL can be the same — device flow never calls it). The client ID is public.',
+  )
+  function setSigninErr(message: string): void {
+    signinErr.textContent = message
+    signinErr.hidden = false
+    signinErr.scrollIntoView({ block: 'nearest' })
+  }
+  function clearSigninErr(): void {
+    signinErr.hidden = true
+    signinErr.textContent = ''
+  }
   const signinBtn = el('button', 'btn btn-secondary', 'Sign in with GitHub')
   signinBtn.type = 'button'
   const signinState = el('p', 'muted signin-state')
@@ -1268,9 +1292,12 @@ function buildSettingsPanel(): HTMLDivElement {
     void (async () => {
       const id = parseOAuthClientId(clientId.input.value)
       if (id === '') {
-        setStatus('Enter your OAuth app client ID first — it is public, not a secret.')
+        setSigninErr(
+          'Enter your OAuth app client ID first — it is public, not a secret. Use "Create an OAuth app on GitHub" above if you do not have one.',
+        )
         return
       }
+      clearSigninErr()
       lsSet(KEYS.oauthClientId, id)
       const mySeq = ++signinSeq
       const abort = new AbortController()
@@ -1287,13 +1314,14 @@ function buildSettingsPanel(): HTMLDivElement {
         if (mySeq !== signinSeq) return
         signinBtn.disabled = false
         deviceCard.hidden = true
-        setStatus(ghAuthErrorMessage(err))
+        setSigninErr(ghAuthErrorMessage(err))
         return
       }
       if (mySeq !== signinSeq) return
       deviceCodeEl.textContent = start.userCode
       deviceLink.href = start.verificationUri
       deviceStatus.textContent = 'Waiting for you to finish signing in…'
+      deviceCard.scrollIntoView({ block: 'nearest' })
       try {
         const token = await pollForToken(id, start, {
           onPoll: (progress) => {
@@ -1312,7 +1340,7 @@ function buildSettingsPanel(): HTMLDivElement {
         signinBtn.disabled = false
         deviceCard.hidden = true
         if (!stored.ok) {
-          setStatus(stored.message)
+          setSigninErr(stored.message)
           return
         }
         signinState.textContent = 'Signed in — the stored GitHub token powers PR fetching and Copilot.'
@@ -1321,7 +1349,7 @@ function buildSettingsPanel(): HTMLDivElement {
         if (mySeq !== signinSeq) return
         signinBtn.disabled = false
         deviceCard.hidden = true
-        setStatus(
+        setSigninErr(
           err === SIGNIN_CANCEL || err === POLL_ABORTED
             ? 'Sign-in cancelled.'
             : ghAuthErrorMessage(err),
@@ -1854,7 +1882,10 @@ function buildSettingsPanel(): HTMLDivElement {
   })
 
   panel.appendChild(clientId.wrap)
+  panel.appendChild(createOauthLink)
+  panel.appendChild(createOauthHint)
   panel.appendChild(signinBtn)
+  panel.appendChild(signinErr)
   panel.appendChild(signinState)
   panel.appendChild(deviceCard)
   panel.appendChild(pat.wrap)
