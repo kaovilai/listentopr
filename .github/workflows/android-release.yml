@@ -26,6 +26,15 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
+        continue-on-error: true
+
+      - name: Accept Android SDK licenses (preinstalled SDK)
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          # bubblewrap rejects an SDK without a bin/ folder at its root
+          ln -sfn "$ANDROID_HOME/cmdline-tools/latest/bin" "$ANDROID_HOME/bin"
 
       - name: Install bubblewrap
         run: npm install -g @bubblewrap/cli
