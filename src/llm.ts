@@ -1,4 +1,4 @@
-// Multi-provider chat client for ListenToPR (openai / anthropic / gemini / github).
+// Multi-provider chat client for ListenToPR (openai / anthropic / gemini / github / copilot).
 import type { LlmConfig, LlmMessage, LlmProvider } from './types'
 
 /** Typed error thrown by chat(): carries HTTP status and a sanitized body. */
@@ -33,6 +33,7 @@ export const PROVIDER_DEFAULT_ENDPOINTS: Record<LlmProvider, string> = {
   anthropic: 'https://api.anthropic.com',
   gemini: 'https://generativelanguage.googleapis.com',
   github: 'https://models.github.ai',
+  copilot: 'https://api.githubcopilot.com',
 }
 
 function providerOf(config: LlmConfig): LlmProvider {
@@ -139,12 +140,15 @@ function openaiRequest(
     return { role: m.role, content }
   })
   const base = baseOf(config, provider)
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${config.apiKey}`,
+  }
+  // Copilot API requires the integration id header alongside the Bearer token.
+  if (provider === 'copilot') headers['Copilot-Integration-Id'] = 'vscode-chat'
   return {
     url: provider === 'github' ? githubUrl(base) : `${base}/chat/completions`,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.apiKey}`,
-    },
+    headers,
     body: JSON.stringify({ model, messages: requestMessages }),
   }
 }

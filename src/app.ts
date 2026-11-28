@@ -34,6 +34,19 @@ import {
   type CatalogModel,
   type CatalogStorage,
 } from './modelcatalog'
+import {
+  startDeviceFlow,
+  pollForToken,
+  GhAuthError,
+  POLL_ABORTED,
+  type DeviceFlowStart,
+  type PollProgress,
+} from './ghauth'
+import {
+  fetchCopilotModels,
+  createCopilotModelsCache,
+  type CopilotModel,
+} from './copilotmodels'
 import { createTtsController, listVoices } from './tts'
 import { createWakeLockController, shouldShowWakeLockFallback } from './wakelock'
 import { createUpdateController, type UpdateController } from './update'
@@ -111,15 +124,17 @@ const KEYS = {
   detail: 'listentopr.detail',
   prefs: 'listentopr.tts-prefs',
   wlDismissed: 'listentopr.wl-banner-dismissed',
+  oauthClientId: 'listentopr.oauth-client-id',
 } as const
 
-const PROVIDERS: readonly LlmProvider[] = ['openai', 'anthropic', 'gemini', 'github']
+const PROVIDERS: readonly LlmProvider[] = ['openai', 'anthropic', 'gemini', 'github', 'copilot']
 
 const PROVIDER_NAMES: ReadonlyArray<readonly [LlmProvider, string]> = [
   ['openai', 'OpenAI'],
   ['anthropic', 'Anthropic'],
   ['gemini', 'Gemini'],
   ['github', 'GitHub Models'],
+  ['copilot', 'GitHub Copilot'],
 ]
 
 /** Persisted provider choice; 'openai' when unset or invalid. */
@@ -130,8 +145,9 @@ export function readProvider(): LlmProvider {
 
 /**
  * Resolved LLM API key: the explicit llm-api-key when set; the GitHub Models
- * provider otherwise falls back to the stored GitHub PAT, which doubles as
- * the model key. Never returns the token for other providers.
+ * and GitHub Copilot providers otherwise fall back to the stored GitHub token
+ * (sign-in gho_ or PAT), which doubles as the model key. Never returns the
+ * token for other providers.
  */
 export function resolveLlmApiKey(
   provider: LlmProvider,
@@ -139,11 +155,12 @@ export function resolveLlmApiKey(
   githubToken: string,
 ): string {
   if (llmKey !== '') return llmKey
-  return provider === 'github' ? githubToken : ''
+  return provider === 'github' || provider === 'copilot' ? githubToken : ''
 }
 
-/** Shown instead of firing an LLM call with an empty GitHub Models Bearer. */
-const GITHUB_KEY_MSG = 'Add a GitHub token in Settings (it doubles as your model key)'
+/** Shown instead of firing an LLM call with an empty GitHub Models/Copilot Bearer. */
+const GITHUB_KEY_MSG =
+  'Add a GitHub token in Settings — sign in with GitHub, or paste a PAT (it doubles as your model key)'
 
 // ---------- GitHub Models catalog picker decision ----------
 
@@ -196,6 +213,133 @@ function catalogStorage(): CatalogStorage {
     return window.localStorage
   } catch {
     return { getItem: () => null, setItem: () => {} }
+  }
+}
+
+// ---------- GitHub Copilot model picker decision ----------
+
+/** Cache entry shape the Copilot model-picker decision helper reads. */
+export interface CopilotModelsEntry {
+  models: CopilotModel[]
+  fetchedAt: number
+}
+
+/** Injectable seams for the Copilot model-picker decision (tests use fakes). */
+export interface CopilotModelsDeps {
+  readCache(): CopilotModelsEntry | null
+  writeCache(models: CopilotModel[]): void
+  fetchModels(token: string): Promise<CopilotModel[]>
+}
+
+/**
+ * Decide how the Copilot picker populates its selects, mirroring
+ * resolveModelCatalog: a fresh cache entry is served with no network call, a
+ * miss fetches and re-caches, and any failure (including an empty token)
+ * degrades to the free-text inputs with the reason surfaced.
+ */
+export async function resolveCopilotModels(
+  token: string,
+  deps: CopilotModelsDeps,
+): Promise<ModelCatalogOutcome> {
+  if (token === '') return { kind: 'fallback', reason: 'no token' }
+  const cached = deps.readCache()
+  if (cached !== null) return { kind: 'cache', models: copilotModelsAsCatalog(cached.models) }
+  let models: CopilotModel[]
+  try {
+    models = await deps.fetchModels(token)
+  } catch (err) {
+    return { kind: 'fallback', reason: sanitizeError(err) }
+  }
+  deps.writeCache(models)
+  return { kind: 'fetch', models: copilotModelsAsCatalog(models) }
+}
+
+/**
+ * Map Copilot model-list entries onto the catalog shape the shared picker
+ * helpers (groupByPublisher, fillCatalogSelect) consume. No publisher or
+ * token-limit data exists on the Copilot list, so every model lands in one
+ * 'Copilot' group with no summary and no context auto-fill; only confirmed
+ * image input counts as vision-capable (null stays out of the vision picker).
+ */
+export function copilotModelsAsCatalog(models: CopilotModel[]): CatalogModel[] {
+  return models.map((m) => ({
+    id: m.id,
+    name: m.name,
+    publisher: 'Copilot',
+    summary: '',
+    vision: m.vision === true,
+    maxInputTokens: null,
+    rateLimitTier: null,
+  }))
+}
+
+// ---------- Sign in with GitHub (device flow) ----------
+
+/** Persisted OAuth client ID ('listentopr.oauth-client-id'); trimmed, '' when unset. */
+export function parseOAuthClientId(raw: string | null): string {
+  return raw === null ? '' : raw.trim()
+}
+
+/** Current persisted client ID (used to prefill the Settings field). */
+function readOAuthClientId(): string {
+  return parseOAuthClientId(lsGet(KEYS.oauthClientId))
+}
+
+/** Status line while pollForToken waits for the user to approve on github.com. */
+export function devicePollStatus(progress: PollProgress): string {
+  const base = 'Waiting for you to finish signing in…'
+  if (progress.lastError === 'slow_down') {
+    return `${base} (checking a little slower, attempt ${progress.attempt})`
+  }
+  return `${base} (attempt ${progress.attempt})`
+}
+
+/**
+ * Actionable text for a device-flow failure. GhAuthError codes map to a next
+ * step; anything else passes through sanitizeError. Never embeds a token —
+ * ghauth.ts guarantees that.
+ */
+export function ghAuthErrorMessage(err: unknown): string {
+  if (err instanceof GhAuthError) {
+    switch (err.code) {
+      case 'expired':
+        return 'Sign-in code expired — start sign-in again.'
+      case 'access_denied':
+        return 'Sign-in was denied. Start again if that was not on purpose.'
+      case 'unsupported_grant_type':
+        return 'GitHub rejected the device sign-in for this app — check the OAuth client ID.'
+      case 'network':
+        return 'Network error contacting GitHub — check your connection and retry.'
+      default:
+        return err.message
+    }
+  }
+  return sanitizeError(err)
+}
+
+/** Thrown from onPoll to abort polling when the user cancels the sign-in card. */
+const SIGNIN_CANCEL = new Error('signin cancelled')
+
+/** Result of storing the sign-in token: ok, or ok:false with a sanitized message. */
+export type SignInStoreResult = { ok: true } | { ok: false; message: string }
+
+/**
+ * Final step of device-flow sign-in: persist the gho_ token as
+ * 'github-token'. Storage failures (vault locked mid-flow, IndexedDB quota
+ * or private-mode errors) return {ok:false, message} instead of throwing,
+ * so the caller's stale-flow guard cannot swallow them — the UI re-enables
+ * sign-in and says why.
+ */
+export async function completeDeviceSignIn(
+  token: string,
+  deps: { putSecret?: (id: SecretId, value: string) => Promise<void> } = {},
+): Promise<SignInStoreResult> {
+  const put = deps.putSecret ?? ((id, value) => vault.putSecret(id, value))
+  try {
+    await put('github-token', token)
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, message: ghAuthErrorMessage(err) }
   }
 }
 
@@ -1084,7 +1228,114 @@ function buildSettingsPanel(): HTMLDivElement {
   panel.hidden = true
   panel.appendChild(el('h2', 'panel-title', 'Settings'))
 
-  const pat = labeledInput('GitHub personal access token', 'password')
+  // ---------- Sign in with GitHub (device flow) ----------
+  // The client ID is public (it appears in the page's own sign-in request),
+  // so it persists in localStorage, not the vault. The resulting gho_ token
+  // lands in the vault as 'github-token' and REPLACES the PAT for both PR
+  // fetching and the Copilot provider.
+  const clientId = labeledInput('GitHub OAuth app client ID (for sign-in)', 'text', readOAuthClientId())
+  clientId.input.placeholder = 'from Settings > Developer settings > OAuth Apps'
+  const signinBtn = el('button', 'btn btn-secondary', 'Sign in with GitHub')
+  signinBtn.type = 'button'
+  const signinState = el('p', 'muted signin-state')
+  void vaultGetSecret('github-token').then((t) => {
+    if (t) signinState.textContent = 'Signed in — the stored GitHub token powers PR fetching and Copilot.'
+  })
+  const deviceCard = el('div', 'device-card')
+  deviceCard.hidden = true
+  deviceCard.setAttribute('role', 'status')
+  deviceCard.setAttribute('aria-live', 'polite')
+  const deviceTitle = el('p', 'device-title', 'Enter this code on GitHub')
+  const deviceCodeEl = el('p', 'device-code')
+  const deviceLink = el('a', 'device-link', 'Open github.com/login/device')
+  deviceLink.target = '_blank'
+  deviceLink.rel = 'noopener noreferrer'
+  const deviceStatus = el('p', 'muted device-status')
+  const deviceCancel = el('button', 'btn btn-small', 'Cancel')
+  deviceCancel.type = 'button'
+  /** Bumped per sign-in attempt; a superseded or cancelled flow stops acting on the UI. */
+  let signinSeq = 0
+  /** Aborts the in-flight token poll when the user cancels the device card. */
+  let signinAbort: AbortController | null = null
+  deviceCancel.addEventListener('click', () => {
+    signinSeq++
+    signinAbort?.abort()
+    deviceCard.hidden = true
+    signinBtn.disabled = false
+    setStatus('Sign-in cancelled.', 'info')
+  })
+  signinBtn.addEventListener('click', () => {
+    void (async () => {
+      const id = parseOAuthClientId(clientId.input.value)
+      if (id === '') {
+        setStatus('Enter your OAuth app client ID first — it is public, not a secret.')
+        return
+      }
+      lsSet(KEYS.oauthClientId, id)
+      const mySeq = ++signinSeq
+      const abort = new AbortController()
+      signinAbort = abort
+      signinBtn.disabled = true
+      deviceCard.hidden = false
+      deviceCodeEl.textContent = '…'
+      deviceLink.href = '#'
+      deviceStatus.textContent = 'Contacting GitHub…'
+      let start: DeviceFlowStart
+      try {
+        start = await startDeviceFlow(id)
+      } catch (err) {
+        if (mySeq !== signinSeq) return
+        signinBtn.disabled = false
+        deviceCard.hidden = true
+        setStatus(ghAuthErrorMessage(err))
+        return
+      }
+      if (mySeq !== signinSeq) return
+      deviceCodeEl.textContent = start.userCode
+      deviceLink.href = start.verificationUri
+      deviceStatus.textContent = 'Waiting for you to finish signing in…'
+      try {
+        const token = await pollForToken(id, start, {
+          onPoll: (progress) => {
+            if (mySeq !== signinSeq) throw SIGNIN_CANCEL
+            deviceStatus.textContent = devicePollStatus(progress)
+          },
+          signal: abort.signal,
+        })
+        if (mySeq !== signinSeq) return
+        // Storing can fail (vault locked mid-flow, IndexedDB quota or
+        // private-mode errors); completeDeviceSignIn reports that instead
+        // of throwing past this flow's seq guard, so the UI always
+        // re-enables and shows why.
+        const stored = await completeDeviceSignIn(token)
+        if (mySeq !== signinSeq) return
+        signinBtn.disabled = false
+        deviceCard.hidden = true
+        if (!stored.ok) {
+          setStatus(stored.message)
+          return
+        }
+        signinState.textContent = 'Signed in — the stored GitHub token powers PR fetching and Copilot.'
+        setStatus('Signed in.', 'info')
+      } catch (err) {
+        if (mySeq !== signinSeq) return
+        signinBtn.disabled = false
+        deviceCard.hidden = true
+        setStatus(
+          err === SIGNIN_CANCEL || err === POLL_ABORTED
+            ? 'Sign-in cancelled.'
+            : ghAuthErrorMessage(err),
+        )
+      }
+    })()
+  })
+  deviceCard.appendChild(deviceTitle)
+  deviceCard.appendChild(deviceCodeEl)
+  deviceCard.appendChild(deviceLink)
+  deviceCard.appendChild(deviceStatus)
+  deviceCard.appendChild(deviceCancel)
+
+  const pat = labeledInput('GitHub personal access token (alternative to sign-in)', 'password')
 
   const providerWrap = el('div', 'field')
   const providerLabel = el('label', 'field-label', 'LLM provider')
@@ -1113,10 +1364,22 @@ function buildSettingsPanel(): HTMLDivElement {
 
   // GitHub Models reuses the stored GitHub PAT as its model key, so the key
   // field is optional there and model ids are namespaced ('openai/gpt-4o').
+  // Copilot reuses the same token (sign-in gho_ or PAT) against
+  // api.githubcopilot.com; Business/Enterprise tenants need the other origin.
   const syncProviderHints = (): void => {
     const github = providerSelect.value === 'github'
-    apiKey.setLabel(github ? 'LLM API key (optional — uses your GitHub token)' : 'LLM API key')
-    model.input.placeholder = github ? 'openai/gpt-4o' : ''
+    const copilot = providerSelect.value === 'copilot'
+    apiKey.setLabel(
+      github
+        ? 'LLM API key (optional — uses your GitHub token)'
+        : copilot
+          ? 'LLM API key (optional — uses your GitHub sign-in or PAT)'
+          : 'LLM API key',
+    )
+    model.input.placeholder = github ? 'openai/gpt-4o' : copilot ? 'gpt-5.6-luna' : ''
+    endpoint.input.placeholder = copilot
+      ? 'default api.githubcopilot.com (Business/Enterprise: api.business.githubcopilot.com)'
+      : ''
   }
   providerSelect.addEventListener('change', syncProviderHints)
   syncProviderHints()
@@ -1154,13 +1417,15 @@ function buildSettingsPanel(): HTMLDivElement {
   detailLabel.appendChild(detailBox)
   detailWrap.appendChild(detailLabel)
 
-  // ---------- GitHub Models live catalog picker ----------
+  // ---------- live model pickers (GitHub Models catalog, Copilot list) ----------
   // With provider = GitHub Models the model and vision-model fields become
   // selects fed by the live catalog (models.github.ai), options grouped by
-  // publisher, label 'name (id)', summary on hover. 'Custom…' flips back to
-  // the free-text input (remembered for the session only). Any load failure
-  // falls back to the plain text inputs with the reason shown; the rest of
-  // Settings keeps working throughout.
+  // publisher, label 'name (id)', summary on hover. With provider = GitHub
+  // Copilot the same selects are fed by the Copilot model list
+  // (api.githubcopilot.com/models), one 'Copilot' group. 'Custom…' flips back
+  // to the free-text input (remembered for the session only). Any load
+  // failure falls back to the plain text inputs with the reason shown; the
+  // rest of Settings keeps working throughout.
   const CUSTOM_OPTION = '__custom__'
 
   const modelSelect = el('select', 'select')
@@ -1180,6 +1445,14 @@ function buildSettingsPanel(): HTMLDivElement {
   let catalogModels: CatalogModel[] = []
   /** Bumped per catalog load so a superseded async result cannot clobber a newer one. */
   let catalogLoadSeq = 0
+  /** Which picker provider the loaded models came from ('github' | 'copilot'). */
+  let catalogSourceProvider: 'github' | 'copilot' | null = null
+
+  /** The provider whose picker needs models right now; null for text-only providers. */
+  function pickerProvider(): 'github' | 'copilot' | null {
+    const v = providerSelect.value
+    return v === 'github' || v === 'copilot' ? v : null
+  }
 
   /** Populate one picker select; visionOnly keeps just vision-capable models. */
   function fillCatalogSelect(
@@ -1219,12 +1492,14 @@ function buildSettingsPanel(): HTMLDivElement {
 
   /** Show selects vs text inputs per provider, loaded models, and Custom choices. */
   function syncModelPickerVisibility(): void {
-    const useSelects = providerSelect.value === 'github' && catalogModels.length > 0
+    const p = pickerProvider()
+    const useSelects =
+      p !== null && catalogSourceProvider === p && catalogModels.length > 0
     modelSelect.hidden = !useSelects || modelPickerCustom
     model.input.hidden = useSelects && !modelPickerCustom
     visionSelect.hidden = !useSelects || visionPickerCustom
     visionModel.input.hidden = useSelects && !visionPickerCustom
-    refreshModelsBtn.hidden = providerSelect.value !== 'github'
+    refreshModelsBtn.hidden = p === null
   }
 
   /**
@@ -1268,25 +1543,35 @@ function buildSettingsPanel(): HTMLDivElement {
   }
 
   /**
-   * Cache-first catalog population (force = refresh button: skip the cache
-   * read, still re-cache the result). Never blocks the rest of Settings:
-   * everything async, stale results dropped via catalogLoadSeq.
+   * Cache-first model-list population for whichever picker provider is
+   * selected (force = refresh button: skip the cache read, still re-cache
+   * the result). Never blocks the rest of Settings: everything async, stale
+   * results dropped via catalogLoadSeq. GitHub Models reads the
+   * models.github.ai catalog; Copilot reads api.githubcopilot.com/models —
+   * both keyed by the same resolved token (explicit llm-api-key ?? GitHub
+   * sign-in token / PAT).
    */
   async function loadCatalog(force: boolean): Promise<void> {
-    if (providerSelect.value !== 'github') return
+    const p = pickerProvider()
+    if (p === null) return
     const mySeq = ++catalogLoadSeq
     catalogHint.textContent = 'Loading models…'
     catalogHint.hidden = false
-    // The model key for the github provider: explicit llm-api-key ?? GitHub PAT.
     const llmKey = (await vaultGetSecret('llm-api-key')) ?? ''
     const ghToken = (await vaultGetSecret('github-token')) ?? ''
-    const token = resolveLlmApiKey('github', llmKey, ghToken)
-    const cache = createCatalogCache(catalogStorage())
-    const outcome = await resolveModelCatalog(token, {
-      readCache: force ? () => null : cache.read,
-      writeCache: cache.write,
-      fetchCatalog: (t) => fetchModelCatalog(t),
-    })
+    const token = resolveLlmApiKey(p, llmKey, ghToken)
+    const outcome: ModelCatalogOutcome =
+      p === 'github'
+        ? await resolveModelCatalog(token, {
+            readCache: force ? () => null : createCatalogCache(catalogStorage()).read,
+            writeCache: createCatalogCache(catalogStorage()).write,
+            fetchCatalog: (t) => fetchModelCatalog(t),
+          })
+        : await resolveCopilotModels(token, {
+            readCache: force ? () => null : createCopilotModelsCache(catalogStorage()).read,
+            writeCache: createCopilotModelsCache(catalogStorage()).write,
+            fetchModels: (t) => fetchCopilotModels(t),
+          })
     if (mySeq !== catalogLoadSeq) return
     if (outcome.kind === 'fallback') {
       catalogModels = []
@@ -1296,7 +1581,16 @@ function buildSettingsPanel(): HTMLDivElement {
       return
     }
     catalogHint.hidden = true
+    catalogSourceProvider = p
     applyCatalogModels(outcome.models)
+  }
+
+  /** Load the current picker provider's models when missing or from the other provider. */
+  function ensureCatalogLoaded(): void {
+    const p = pickerProvider()
+    if (p !== null && (catalogSourceProvider !== p || catalogModels.length === 0)) {
+      void loadCatalog(false)
+    }
   }
 
   refreshModelsBtn.addEventListener('click', () => {
@@ -1304,11 +1598,11 @@ function buildSettingsPanel(): HTMLDivElement {
   })
   providerSelect.addEventListener('change', () => {
     syncModelPickerVisibility()
-    if (providerSelect.value === 'github' && catalogModels.length === 0) void loadCatalog(false)
+    ensureCatalogLoaded()
   })
   syncModelPickerVisibility()
   settingsOpenHook = () => {
-    void loadCatalog(false)
+    ensureCatalogLoaded()
   }
 
   model.wrap.appendChild(modelSelect)
@@ -1494,6 +1788,12 @@ function buildSettingsPanel(): HTMLDivElement {
             setStatus(
               'Heads up: that token does not look like a GitHub PAT (expected ghp_…, github_pat_…, gho_… or a 40-char classic token). Saved anyway.',
             )
+          } else if (/^(ghp_|[0-9a-fA-F]{40})/.test(patVal)) {
+            // Classic PATs carry no Copilot entitlement — the GitHub Copilot
+            // provider needs a sign-in token (gho_) or a fine-grained PAT.
+            setStatus(
+              'Heads up: classic ghp_ tokens cannot use the GitHub Copilot provider (PR fetching and GitHub Models still work). Sign in with GitHub or use a fine-grained PAT for Copilot. Saved anyway.',
+            )
           }
           await vault.putSecret('github-token', patVal)
           pat.input.value = ''
@@ -1504,6 +1804,7 @@ function buildSettingsPanel(): HTMLDivElement {
           apiKey.input.value = ''
         }
         lsSet(KEYS.provider, providerSelect.value)
+        lsSet(KEYS.oauthClientId, parseOAuthClientId(clientId.input.value))
         lsSet(KEYS.endpoint, endpoint.input.value.trim())
         lsSet(KEYS.model, model.input.value.trim())
         lsSet(KEYS.visionModel, visionModel.input.value.trim())
@@ -1552,6 +1853,10 @@ function buildSettingsPanel(): HTMLDivElement {
     })()
   })
 
+  panel.appendChild(clientId.wrap)
+  panel.appendChild(signinBtn)
+  panel.appendChild(signinState)
+  panel.appendChild(deviceCard)
   panel.appendChild(pat.wrap)
   panel.appendChild(providerWrap)
   panel.appendChild(endpoint.wrap)
@@ -2606,7 +2911,7 @@ function showMain(): void {
   const settingsPanel = buildSettingsPanel()
   settingsBtn.addEventListener('click', () => {
     settingsPanel.hidden = !settingsPanel.hidden
-    // Opening Settings with the github provider populates the model pickers.
+    // Opening Settings with the github/copilot provider populates the model pickers.
     if (!settingsPanel.hidden) settingsOpenHook?.()
   })
 
@@ -2998,8 +3303,9 @@ async function loadPulledPr(
     model: lsGet(KEYS.model) ?? '',
     ...(visionModel !== '' ? { visionModel } : {}),
   }
-  // GitHub Models without any usable key: never send an empty Bearer.
-  const githubKeyMissing = cfg.provider === 'github' && cfg.apiKey === ''
+  // GitHub Models / Copilot without any usable key: never send an empty Bearer.
+  const githubKeyMissing =
+    (cfg.provider === 'github' || cfg.provider === 'copilot') && cfg.apiKey === ''
   if (myLoad !== loadToken) return
 
   // ---------- cache hit: instant load, no LLM ----------

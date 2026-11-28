@@ -100,12 +100,13 @@ describe('chat timeout coverage', () => {
 // ---------------------------------------------------------------------------
 
 describe('PROVIDER_DEFAULT_ENDPOINTS', () => {
-  it('exposes the public defaults for all four providers', () => {
+  it('exposes the public defaults for all five providers', () => {
     expect(PROVIDER_DEFAULT_ENDPOINTS).toEqual({
       openai: 'https://api.openai.com/v1',
       anthropic: 'https://api.anthropic.com',
       gemini: 'https://generativelanguage.googleapis.com',
       github: 'https://models.github.ai',
+      copilot: 'https://api.githubcopilot.com',
     })
   })
 })
@@ -351,6 +352,105 @@ describe('github adapter', () => {
     expect(llmErr.status).toBe(401)
     expect(llmErr.body).toBe('bad token [redacted] rejected')
     expect(llmErr.message).not.toContain('ghp_pat-secret')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Copilot adapter (OpenAI dialect over api.githubcopilot.com, gho_ token as Bearer)
+// ---------------------------------------------------------------------------
+
+describe('copilot adapter', () => {
+  it('empty endpoint falls back to the Copilot default with the /chat/completions path', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    await chat(providerConfig('copilot', { endpoint: '' }), [{ role: 'user', text: 'hi' }])
+    expect(lastCall(mock).url).toBe('https://api.githubcopilot.com/chat/completions')
+  })
+
+  it('posts to {base}/chat/completions with Bearer token and Copilot-Integration-Id headers', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'hello' } }] })
+    const result = await chat(
+      providerConfig('copilot', { apiKey: 'gho_copilot-secret' }),
+      [{ role: 'user', text: 'hi' }],
+    )
+    const { url, init } = lastCall(mock)
+    expect(url).toBe('https://api.githubcopilot.com/chat/completions')
+    expect(init.method).toBe('POST')
+    const headers = init.headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer gho_copilot-secret')
+    expect(headers['Copilot-Integration-Id']).toBe('vscode-chat')
+    expect(headers['Content-Type']).toBe('application/json')
+    expect(headers['x-api-key']).toBeUndefined()
+    expect(result).toBe('hello')
+  })
+
+  it('endpoint override is respected (Business/Enterprise api.business.githubcopilot.com)', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    await chat(providerConfig('copilot', { endpoint: 'https://api.business.githubcopilot.com' }), [
+      { role: 'user', text: 'hi' },
+    ])
+    expect(lastCall(mock).url).toBe('https://api.business.githubcopilot.com/chat/completions')
+    const headers = lastCall(mock).init.headers as Record<string, string>
+    expect(headers['Copilot-Integration-Id']).toBe('vscode-chat')
+  })
+
+  it('endpoint override with trailing slash is stripped, not doubled', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    await chat(providerConfig('copilot', { endpoint: 'https://api.business.githubcopilot.com/' }), [
+      { role: 'user', text: 'hi' },
+    ])
+    expect(lastCall(mock).url).toBe('https://api.business.githubcopilot.com/chat/completions')
+  })
+
+  it('sends the OpenAI body shape: model id verbatim, image_url parts after the text part', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    const messages: LlmMessage[] = [
+      { role: 'user', text: 'look', images: [PNG_DATA_URL, 'https://example.com/cat.png'] },
+    ]
+    await chat(providerConfig('copilot', { model: 'claude-haiku-4.5' }), messages)
+    expect(sentBody(mock)).toEqual({
+      model: 'claude-haiku-4.5',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'look' },
+            { type: 'image_url', image_url: { url: PNG_DATA_URL } },
+            { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } },
+          ],
+        },
+      ],
+    })
+  })
+
+  it('image-bearing call uses visionModel; text-only call keeps the primary model', async () => {
+    const mock = stubJson({ choices: [{ message: { content: 'ok' } }] })
+    await chat(
+      providerConfig('copilot', { model: 'gpt-5.6-luna', visionModel: 'gpt-5.6-vision' }),
+      [{ role: 'user', text: 'look', images: [PNG_DATA_URL] }],
+    )
+    expect(sentBody(mock).model).toBe('gpt-5.6-vision')
+
+    await chat(
+      providerConfig('copilot', { model: 'gpt-5.6-luna', visionModel: 'gpt-5.6-vision' }),
+      [{ role: 'user', text: 'hi' }],
+    )
+    expect(sentBody(mock).model).toBe('gpt-5.6-luna')
+  })
+
+  it('redacts the token from an error body', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response('bad token gho_copilot-secret rejected', { status: 401 }))),
+    )
+    const err = await chat(
+      providerConfig('copilot', { apiKey: 'gho_copilot-secret' }),
+      [{ role: 'user', text: 'hi' }],
+    ).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(LlmError)
+    const llmErr = err as LlmError
+    expect(llmErr.status).toBe(401)
+    expect(llmErr.body).toBe('bad token [redacted] rejected')
+    expect(llmErr.message).not.toContain('gho_copilot-secret')
   })
 })
 

@@ -130,8 +130,8 @@ key (stored encrypted in the vault). Provider defaults:
 
 | Setting | Values / default | Notes |
 | --- | --- | --- |
-| Provider | `openai` (default), `anthropic`, `gemini`, `github` | API dialect used by `src/llm.ts` |
-| Endpoint | empty = provider default | OpenAI `https://api.openai.com/v1` (`/chat/completions`), Anthropic `https://api.anthropic.com` (`/v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01`), Gemini `https://generativelanguage.googleapis.com` (`/v1beta/models/{model}:generateContent?key=`), GitHub Models `https://models.github.ai` (`/inference/chat/completions`) |
+| Provider | `openai` (default), `anthropic`, `gemini`, `github`, `copilot` | API dialect used by `src/llm.ts` |
+| Endpoint | empty = provider default | OpenAI `https://api.openai.com/v1` (`/chat/completions`), Anthropic `https://api.anthropic.com` (`/v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01`), Gemini `https://generativelanguage.googleapis.com` (`/v1beta/models/{model}:generateContent?key=`), GitHub Models `https://models.github.ai` (`/inference/chat/completions`), GitHub Copilot `https://api.githubcopilot.com` (`/chat/completions`) |
 | Model | any model id the provider accepts | used for text-only calls |
 | Vision model | optional | used only for image-bearing calls (the architecture section); falls back to Model |
 
@@ -157,6 +157,42 @@ ids (remembered for the session only), and if the catalog cannot be loaded
 with the reason shown. Picking a model with a known input limit auto-fills
 the Advanced context-window field when it is empty. Fine-grained PATs need
 the `models: read` permission for the catalog to load.
+
+## Sign in with GitHub
+
+Settings offers **Sign in with GitHub**, a one-time setup that replaces the
+pasted PAT with a proper OAuth sign-in token:
+
+1. Create an OAuth app once: GitHub **Settings > Developer settings > OAuth
+   Apps > New OAuth App**. The callback URL is not used by the device flow —
+   enter this site's URL (`https://github.tig.pw/listentopr/`) in both URL
+   fields and finish the form.
+2. Copy the app's **client ID** and paste it into the "GitHub OAuth app
+   client ID" field in ListenToPR's Settings. The client ID is public, not a
+   secret, so it persists in localStorage.
+3. Click **Sign in with GitHub**. A card shows a one-time code; the link
+   opens `github.com/login/device` in a new tab, where you enter that code
+   and authorize the app. **Cancel** aborts while waiting.
+4. The resulting token is stored encrypted in the vault as `github-token`
+   and powers everything: PR fetching on `api.github.com` *and* the GitHub
+   Copilot provider — one sign-in, no PAT pasting.
+
+**GitHub Copilot** (`provider: copilot`) speaks the OpenAI dialect against
+`https://api.githubcopilot.com` (`/chat/completions`) with the same token as
+a Bearer (sign-in `gho_`, `ghu_`, or a fine-grained `github_pat_` with a
+Copilot entitlement). Model ids look like `gpt-5.6-luna` or
+`claude-haiku-4.5`; the model and vision-model fields become live pickers
+fed by the Copilot model list, with the same **Custom…**, **Refresh
+models**, and fallback-to-text treatment as the GitHub Models picker. The
+default endpoint is `api.githubcopilot.com`; Business/Enterprise tenants use
+`api.business.githubcopilot.com` in the endpoint field (routed through the
+service-worker proxy).
+
+Plan requirements: Copilot model access follows your GitHub plan — Luna
+models need Copilot Pro or above, and usage is billed to that plan. Classic
+`ghp_` PATs carry no Copilot entitlement: they keep working for PR fetching
+and GitHub Models, but the Copilot provider needs the sign-in token or a
+fine-grained PAT (Settings warns when you save a classic PAT).
 
 Additionally, the CSP `connect-src` allow-list can bake an endpoint in at
 build time so production builds can talk to it:

@@ -251,6 +251,47 @@ h3 {
   font-size: var(--text-sm);
 }
 
+/* GitHub device-flow sign-in: status line + the verification card that
+   shows the one-time user_code beside a link to github.com/login/device. */
+.signin-state {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.device-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+.device-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.device-code {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  font-family: var(--font-mono, monospace);
+  color: var(--accent-strong);
+  user-select: all;
+}
+
+.device-link {
+  color: var(--accent-strong);
+}
+
+.device-status {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
 .pr-form {
   display: flex;
   gap: var(--space-2);

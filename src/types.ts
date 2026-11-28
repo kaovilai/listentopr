@@ -162,8 +162,13 @@ export interface WakeLockController {
 
 // ---------- LLM ----------
 
-/** 'github' = GitHub Models (models.github.ai): OpenAI dialect, reuses the stored GitHub PAT. */
-export type LlmProvider = 'openai' | 'anthropic' | 'gemini' | 'github'
+/**
+ * 'github' = GitHub Models (models.github.ai): OpenAI dialect, reuses the stored GitHub PAT.
+ * 'copilot' = GitHub Copilot API (api.githubcopilot.com): OpenAI dialect, reuses
+ * the stored GitHub PAT (gho_/ghu_/github_pat_ tokens; classic ghp_ PATs lack
+ * the Copilot entitlement).
+ */
+export type LlmProvider = 'openai' | 'anthropic' | 'gemini' | 'github' | 'copilot'
 
 export interface LlmConfig {
   /** API dialect. Default 'openai'. */

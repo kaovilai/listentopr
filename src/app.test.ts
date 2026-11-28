@@ -3,6 +3,7 @@
 // document/window globals (init() exits early: no #app element).
 import { describe, it, expect, vi, beforeAll } from 'vitest'
 import type { DiagramRenderAllEntry } from './diagrams'
+import { GhAuthError } from './ghauth'
 
 function fakeElement(): any {
   return {
@@ -171,7 +172,7 @@ describe('readProvider', () => {
   })
 
   it('returns each persisted valid provider', () => {
-    for (const provider of ['openai', 'anthropic', 'gemini', 'github'] as const) {
+    for (const provider of ['openai', 'anthropic', 'gemini', 'github', 'copilot'] as const) {
       storage.set('listentopr.llm-provider', provider)
       expect(app.readProvider()).toBe(provider)
     }
@@ -180,13 +181,14 @@ describe('readProvider', () => {
 
 describe('resolveLlmApiKey', () => {
   it('prefers the explicit LLM key when set, for every provider', () => {
-    for (const provider of ['openai', 'anthropic', 'gemini', 'github'] as const) {
+    for (const provider of ['openai', 'anthropic', 'gemini', 'github', 'copilot'] as const) {
       expect(app.resolveLlmApiKey(provider, 'sk-llm', 'ghp_token')).toBe('sk-llm')
     }
   })
 
-  it('falls back to the GitHub token only for the github provider', () => {
+  it('falls back to the GitHub token only for the github and copilot providers', () => {
     expect(app.resolveLlmApiKey('github', '', 'ghp_token')).toBe('ghp_token')
+    expect(app.resolveLlmApiKey('copilot', '', 'gho_token')).toBe('gho_token')
     expect(app.resolveLlmApiKey('openai', '', 'ghp_token')).toBe('')
     expect(app.resolveLlmApiKey('anthropic', '', 'ghp_token')).toBe('')
     expect(app.resolveLlmApiKey('gemini', '', 'ghp_token')).toBe('')
@@ -194,7 +196,160 @@ describe('resolveLlmApiKey', () => {
 
   it('is empty when both secrets are empty', () => {
     expect(app.resolveLlmApiKey('github', '', '')).toBe('')
+    expect(app.resolveLlmApiKey('copilot', '', '')).toBe('')
     expect(app.resolveLlmApiKey('openai', '', '')).toBe('')
+  })
+})
+
+describe('parseOAuthClientId', () => {
+  it('trims surrounding whitespace', () => {
+    expect(app.parseOAuthClientId('  Iv1.abc123  ')).toBe('Iv1.abc123')
+  })
+
+  it('is empty for null, empty, and whitespace-only input', () => {
+    expect(app.parseOAuthClientId(null)).toBe('')
+    expect(app.parseOAuthClientId('')).toBe('')
+    expect(app.parseOAuthClientId('   ')).toBe('')
+  })
+})
+
+describe('ghAuthErrorMessage', () => {
+  it('maps each device-flow error code to an actionable message', () => {
+    expect(app.ghAuthErrorMessage(new GhAuthError('expired', 'Sign-in code expired — start sign-in again'))).toContain('expired')
+    expect(app.ghAuthErrorMessage(new GhAuthError('access_denied', 'Sign-in was denied'))).toContain('denied')
+    expect(app.ghAuthErrorMessage(new GhAuthError('unsupported_grant_type', 'rejected'))).toContain('client ID')
+    expect(app.ghAuthErrorMessage(new GhAuthError('network', 'Network error contacting GitHub sign-in'))).toContain('connection')
+  })
+
+  it('passes the ghauth message through for http_error and bad_response', () => {
+    expect(app.ghAuthErrorMessage(new GhAuthError('http_error', 'GitHub sign-in endpoint returned HTTP 500'))).toBe('GitHub sign-in endpoint returned HTTP 500')
+    expect(app.ghAuthErrorMessage(new GhAuthError('bad_response', 'GitHub sign-in endpoint returned non-JSON'))).toBe('GitHub sign-in endpoint returned non-JSON')
+  })
+
+  it('sanitizes non-GhAuthError values', () => {
+    expect(app.ghAuthErrorMessage(new Error('boom'))).toBe('boom')
+    expect(app.ghAuthErrorMessage('nope')).toBe('nope')
+    expect(app.ghAuthErrorMessage(42)).toBe('Something went wrong')
+  })
+})
+
+describe('completeDeviceSignIn', () => {
+  it('stores the token under github-token and reports ok', async () => {
+    const putSecret = vi.fn(async () => {})
+    const out = await app.completeDeviceSignIn('gho_x', { putSecret })
+    expect(out).toEqual({ ok: true })
+    expect(putSecret).toHaveBeenCalledTimes(1)
+    expect(putSecret).toHaveBeenCalledWith('github-token', 'gho_x')
+  })
+
+  it('reports a sanitized message instead of throwing when the vault rejects the write', async () => {
+    const putSecret = vi.fn(async () => {
+      throw new Error('vault is locked')
+    })
+    const out = await app.completeDeviceSignIn('gho_x', { putSecret })
+    expect(out).toEqual({ ok: false, message: 'vault is locked' })
+  })
+
+  it('sanitizes non-Error rejections from the vault', async () => {
+    const putSecret = vi.fn(async () => {
+      throw undefined
+    })
+    const out = await app.completeDeviceSignIn('gho_x', { putSecret })
+    expect(out).toEqual({ ok: false, message: 'Something went wrong' })
+  })
+})
+
+describe('devicePollStatus', () => {
+  it('reports the attempt number while authorization is pending', () => {
+    expect(app.devicePollStatus({ attempt: 3, intervalSeconds: 5, lastError: 'authorization_pending' })).toBe('Waiting for you to finish signing in… (attempt 3)')
+  })
+
+  it('notes the slower cadence after a slow_down response', () => {
+    const s = app.devicePollStatus({ attempt: 2, intervalSeconds: 10, lastError: 'slow_down' })
+    expect(s).toContain('checking a little slower')
+    expect(s).toContain('attempt 2')
+  })
+
+  it('omits the slow-down note when there is no last error', () => {
+    expect(app.devicePollStatus({ attempt: 1, intervalSeconds: 5 })).toBe('Waiting for you to finish signing in… (attempt 1)')
+  })
+})
+
+describe('copilotModelsAsCatalog', () => {
+  it('maps Copilot entries onto the catalog picker shape', () => {
+    const out = app.copilotModelsAsCatalog([
+      { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', vision: false },
+      { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5', vision: null },
+      { id: 'gpt-5-vision', name: 'GPT-5 Vision', vision: true },
+    ])
+    expect(out).toEqual([
+      { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', publisher: 'Copilot', summary: '', vision: false, maxInputTokens: null, rateLimitTier: null },
+      { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5', publisher: 'Copilot', summary: '', vision: false, maxInputTokens: null, rateLimitTier: null },
+      { id: 'gpt-5-vision', name: 'GPT-5 Vision', publisher: 'Copilot', summary: '', vision: true, maxInputTokens: null, rateLimitTier: null },
+    ])
+  })
+})
+
+describe('resolveCopilotModels', () => {
+  const models: import('./copilotmodels').CopilotModel[] = [
+    { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', vision: false },
+    { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5', vision: null },
+  ]
+
+  it('serves a fresh cache entry without fetching, mapped onto the catalog shape', async () => {
+    const fetchModels = vi.fn()
+    const writeCache = vi.fn()
+    const out = await app.resolveCopilotModels('gho_x', {
+      readCache: () => ({ models, fetchedAt: Date.now() }),
+      writeCache,
+      fetchModels,
+    })
+    expect(out.kind).toBe('cache')
+    if (out.kind !== 'fallback') {
+      expect(out.models).toEqual(app.copilotModelsAsCatalog(models))
+    }
+    expect(fetchModels).not.toHaveBeenCalled()
+    expect(writeCache).not.toHaveBeenCalled()
+  })
+
+  it('fetches on a cache miss and caches the result', async () => {
+    const fetchModels = vi.fn().mockResolvedValue(models)
+    const writeCache = vi.fn()
+    const out = await app.resolveCopilotModels('gho_x', {
+      readCache: () => null,
+      writeCache,
+      fetchModels,
+    })
+    expect(out.kind).toBe('fetch')
+    expect(fetchModels).toHaveBeenCalledTimes(1)
+    expect(fetchModels).toHaveBeenCalledWith('gho_x')
+    expect(writeCache).toHaveBeenCalledWith(models)
+  })
+
+  it('falls back with the reason when the fetch fails, and does not cache', async () => {
+    const fetchModels = vi.fn().mockRejectedValue(new Error('Copilot model list request failed (401)'))
+    const writeCache = vi.fn()
+    const out = await app.resolveCopilotModels('gho_x', {
+      readCache: () => null,
+      writeCache,
+      fetchModels,
+    })
+    expect(out.kind).toBe('fallback')
+    if (out.kind === 'fallback') expect(out.reason).toContain('(401)')
+    expect(writeCache).not.toHaveBeenCalled()
+  })
+
+  it('falls back with "no token" before reading the cache or fetching', async () => {
+    const readCache = vi.fn()
+    const fetchModels = vi.fn()
+    const out = await app.resolveCopilotModels('', {
+      readCache,
+      writeCache: () => {},
+      fetchModels,
+    })
+    expect(out).toEqual({ kind: 'fallback', reason: 'no token' })
+    expect(readCache).not.toHaveBeenCalled()
+    expect(fetchModels).not.toHaveBeenCalled()
   })
 })
 

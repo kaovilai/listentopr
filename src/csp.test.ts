@@ -14,10 +14,10 @@ import {
 const SHIPPED_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
   "img-src 'self' data: https:; " +
-  "connect-src 'self' https://api.github.com https://github.com https://*.githubusercontent.com https://models.github.ai https://api.example.com; " +
+  "connect-src 'self' https://api.github.com https://github.com https://*.githubusercontent.com https://models.github.ai https://api.githubcopilot.com https://api.example.com; " +
   "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
-const SHIPPED_CONNECT_SRC = "'self' https://api.github.com https://github.com https://*.githubusercontent.com https://models.github.ai https://api.example.com"
+const SHIPPED_CONNECT_SRC = "'self' https://api.github.com https://github.com https://*.githubusercontent.com https://models.github.ai https://api.githubcopilot.com https://api.example.com"
 
 describe('connectSrcValue', () => {
   it('extracts the connect-src directive from a full CSP', () => {
@@ -73,6 +73,17 @@ describe('endpointAllowedByConnectSrc', () => {
     expect(
       endpointAllowedByConnectSrc('https://models.github.ai/inference', SHIPPED_CONNECT_SRC, selfOrigin),
     ).toBe(true)
+  })
+
+  it('allows the GitHub Copilot origin (copilot provider default endpoint)', () => {
+    expect(
+      endpointAllowedByConnectSrc('https://api.githubcopilot.com', SHIPPED_CONNECT_SRC, selfOrigin),
+    ).toBe(true)
+    // Business/Enterprise endpoint override goes through the SW proxy when
+    // its origin is not listed here; the default origin must be direct.
+    expect(
+      endpointAllowedByConnectSrc('https://api.business.githubcopilot.com', SHIPPED_CONNECT_SRC, selfOrigin),
+    ).toBe(false)
   })
 
   it('rejects an endpoint origin absent from connect-src', () => {
