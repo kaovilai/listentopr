@@ -399,6 +399,16 @@ tokens are the `:root` default) and mirrored into
 `listentopr.theme` values from the old light/dark toggle map onto the new
 modes (`light` → Light, anything unknown → Auto).
 
+## Iconography
+
+Controls and banners use [Feather](https://feathericons.com/) icons (MIT
+license; sources vendored under `design/icons/`). `src/icons.ts` builds one
+hidden inline SVG sprite (`injectSprite(document.body)` at init, before any
+view renders) and `icon(name)` hands out `<svg><use href="#lpr-icon-…">`
+references — no external requests and no inline scripts, so the CSP holds.
+Icons inherit `currentColor`, so they follow the theme with zero extra CSS;
+icon-only buttons keep their accessible name via `aria-label`.
+
 ## DVC sign-off matrix
 
 | Criterion | Where implemented |

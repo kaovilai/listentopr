@@ -20,6 +20,7 @@ function fakeElement(): any {
       this.children.push(child)
       return child
     },
+    replaceWith() {},
     addEventListener() {},
     removeEventListener() {},
     setAttribute() {},
@@ -33,6 +34,9 @@ const storage = new Map<string, string>()
 
 const fakeDocument = {
   createElement: () => fakeElement(),
+  // app.ts wires sprite icons at module level (banners), which builds svg
+  // nodes through icons.ts document.createElementNS.
+  createElementNS: () => fakeElement(),
   createTextNode: (text: string) => ({ text }),
   getElementById: () => null,
   querySelector: () => null,
@@ -571,6 +575,21 @@ describe('themeModeLabel / themeModeAria', () => {
     expect(app.themeModeAria('auto')).toBe('Theme: Auto (follows system)')
     expect(app.themeModeAria('light')).toBe('Theme: Light')
     expect(app.themeModeAria('dark')).toBe('Theme: Dark')
+  })
+})
+
+describe('themeModeIcon', () => {
+  it('maps each mode onto its sprite icon name', () => {
+    expect(app.themeModeIcon('auto')).toBe('monitor')
+    expect(app.themeModeIcon('light')).toBe('sun')
+    expect(app.themeModeIcon('dark')).toBe('moon')
+  })
+
+  it('only returns names present in the icon sprite', async () => {
+    const { SPRITE } = await import('./icons')
+    for (const mode of ['auto', 'light', 'dark'] as const) {
+      expect(app.themeModeIcon(mode) in SPRITE).toBe(true)
+    }
   })
 })
 

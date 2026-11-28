@@ -918,3 +918,55 @@ a.file-chip:hover {
   margin: 0.25rem 0 0.5rem;
   overflow-wrap: anywhere;
 }
+
+/* ---------- icons (inline SVG sprite; Feather glyphs via currentColor) ---------- */
+
+/* Default glyph size tracks the surrounding text; playback controls below
+   bump it. vertical-align seats the icon on the text baseline. */
+.icon {
+  width: 1em;
+  height: 1em;
+  flex: none;
+  vertical-align: -0.125em;
+}
+
+/* Icon + text pairing on buttons, chips, links and the sleep-timer label. */
+.btn-has-icon,
+.with-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+}
+
+/* Banners keep their own flex row (icon, text, buttons). */
+.banner.with-icon {
+  display: flex;
+}
+
+/* Playback controls: bigger glyphs. */
+.controls .icon {
+  width: 1.4em;
+  height: 1.4em;
+}
+
+/* Icon-only buttons: keep the 44px minimum touch target via size floor. */
+.btn-icon-only {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+/* No chevron-left in the sprite: mirror the right chevron. */
+.icon-flip-x {
+  transform: scaleX(-1);
+}
+
+/* File chips: once the icon joins, the ellipsis moves to the text span. */
+.file-chip .chip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

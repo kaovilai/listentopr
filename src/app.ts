@@ -52,6 +52,7 @@ import { createWakeLockController, shouldShowWakeLockFallback } from './wakelock
 import { createUpdateController, type UpdateController } from './update'
 import { connectSrcValue, endpointAllowedByConnectSrc, endpointUsable } from './csp'
 import { createStore } from './store'
+import { injectSprite, icon, type IconName } from './icons'
 import { createMediaSessionController, type MediaSessionController } from './mediasession'
 import { createKeyboardController, type KeyboardController } from './keyboard'
 import { createSleepTimer, type SleepTimer } from './sleeptimer'
@@ -91,6 +92,44 @@ function el<T extends keyof HTMLElementTagNameMap>(
   if (cls) node.className = cls
   if (text !== undefined) node.textContent = text
   return node
+}
+
+/**
+ * Icon + text content for a button: clears any text, appends the sprite icon
+ * and a retextable label span. Returns the label span so state changes can
+ * retext the button without wiping the icon.
+ */
+function withIcon(
+  btn: HTMLButtonElement,
+  name: IconName,
+  text: string,
+): HTMLSpanElement {
+  btn.classList.add('btn-has-icon')
+  btn.textContent = ''
+  btn.appendChild(icon(name))
+  const label = el('span', 'btn-label', text)
+  btn.appendChild(label)
+  return label
+}
+
+/**
+ * Icon-only button content (icon replaces the text). The caller must keep the
+ * accessible name via aria-label — the icon svg itself is aria-hidden.
+ */
+function iconOnly(btn: HTMLButtonElement, name: IconName): SVGSVGElement {
+  btn.classList.add('btn-icon-only')
+  btn.textContent = ''
+  const ic = icon(name)
+  btn.appendChild(ic)
+  return ic
+}
+
+/** Icon + text content for a non-button node (banner, chip, link). */
+function withIconGeneric(node: HTMLElement, name: IconName, text: string): void {
+  node.classList.add('with-icon')
+  node.textContent = ''
+  node.appendChild(icon(name))
+  node.appendChild(el('span', undefined, text))
 }
 
 function labeledInput(
@@ -395,15 +434,17 @@ let lastDiagramTheme: ResolvedTheme | null = null
 const diagramsView = createDiagramsView()
 
 let statusEl: HTMLElement | null = null
-const offlineBanner = el('div', 'banner banner-offline', 'Offline — check connection')
+const offlineBanner = el('div', 'banner banner-offline')
 offlineBanner.hidden = true
 offlineBanner.setAttribute('role', 'status')
 offlineBanner.setAttribute('aria-live', 'polite')
+withIconGeneric(offlineBanner, 'wifi-off', 'Offline — check connection')
 
-const updateBanner = el('div', 'banner banner-warn', 'New version available')
+const updateBanner = el('div', 'banner banner-warn')
 updateBanner.hidden = true
 updateBanner.setAttribute('role', 'status')
 updateBanner.setAttribute('aria-live', 'polite')
+withIconGeneric(updateBanner, 'refresh-cw', 'New version available')
 {
   const reloadBtn = el('button', 'btn btn-small', 'Reload')
   reloadBtn.type = 'button'
@@ -415,6 +456,7 @@ updateBanner.setAttribute('aria-live', 'polite')
   dismissBtn.addEventListener('click', () => {
     updateBanner.hidden = true
   })
+  withIcon(dismissBtn, 'x', 'Dismiss')
   updateBanner.appendChild(reloadBtn)
   updateBanner.appendChild(dismissBtn)
 }
@@ -437,6 +479,8 @@ let controlsEl: HTMLElement | null = null
 let playBtn: HTMLButtonElement | null = null
 let pauseBtn: HTMLButtonElement | null = null
 let stopBtn: HTMLButtonElement | null = null
+/** Label span inside playBtn (icon + label structure; see withIcon). */
+let playLabelEl: HTMLSpanElement | null = null
 let voiceSelect: HTMLSelectElement | null = null
 let pendingAutoStartUrl: string | null = null
 
@@ -479,9 +523,15 @@ const SLEEP_PRESETS_MIN = [0, 10, 20, 30, 60]
 
 // ---------- status / errors ----------
 
-function setStatus(message: string, kind: 'error' | 'info' = 'error'): void {
+function setStatus(
+  message: string,
+  kind: 'error' | 'info' = 'error',
+  iconName?: IconName,
+): void {
   if (!statusEl) return
-  statusEl.textContent = message
+  statusEl.textContent = ''
+  if (iconName) statusEl.appendChild(icon(iconName))
+  statusEl.appendChild(el('span', undefined, message))
   statusEl.className = `banner banner-${kind}`
   statusEl.hidden = false
 }
@@ -910,6 +960,13 @@ export function nextThemeMode(mode: ThemeMode): ThemeMode {
   return 'auto'
 }
 
+/** Sprite icon for a theme mode: auto follows the system (monitor). */
+export function themeModeIcon(mode: ThemeMode): IconName {
+  if (mode === 'auto') return 'monitor'
+  if (mode === 'light') return 'sun'
+  return 'moon'
+}
+
 /** Short button caption for a theme mode. */
 export function themeModeLabel(mode: ThemeMode): string {
   if (mode === 'auto') return 'Auto'
@@ -1102,6 +1159,7 @@ function showLocked(): void {
     )
     const reload = el('button', 'btn btn-primary', 'Reload')
     reload.type = 'button'
+    withIcon(reload, 'refresh-cw', 'Reload')
     reload.addEventListener('click', () => {
       try {
         window.location.reload()
@@ -1121,6 +1179,7 @@ function showLocked(): void {
   if (vaultPrfSupported()) {
     const bio = el('button', 'btn btn-secondary', 'Unlock with biometrics')
     bio.type = 'button'
+    withIcon(bio, 'user-check', 'Unlock with biometrics')
     bio.addEventListener('click', () => {
       void (async () => {
         bio.disabled = true
@@ -1141,6 +1200,7 @@ function showLocked(): void {
   const pin = labeledInput('PIN', 'password')
   const btn = el('button', 'btn btn-primary', 'Unlock')
   btn.type = 'button'
+  withIcon(btn, 'unlock', 'Unlock')
 
   async function submit(): Promise<void> {
     btn.disabled = true
@@ -1171,6 +1231,7 @@ function showLocked(): void {
   // instead of a permanent lockout.
   const wipeBtn = el('button', 'btn btn-danger', 'Wipe vault and start fresh')
   wipeBtn.type = 'button'
+  withIcon(wipeBtn, 'trash-2', 'Wipe vault and start fresh')
   wipeBtn.addEventListener('click', () => {
     if (!window.confirm('Wipe all stored keys? This cannot be undone.')) return
     void (async () => {
@@ -1245,6 +1306,7 @@ function buildSettingsPanel(): HTMLDivElement {
   createOauthLink.href = 'https://github.com/settings/applications/new'
   createOauthLink.target = '_blank'
   createOauthLink.rel = 'noopener noreferrer'
+  withIconGeneric(createOauthLink, 'external-link', 'Create an OAuth app on GitHub')
   const createOauthHint = el(
     'p',
     'muted signin-hint',
@@ -1261,6 +1323,7 @@ function buildSettingsPanel(): HTMLDivElement {
   }
   const signinBtn = el('button', 'btn btn-secondary', 'Sign in with GitHub')
   signinBtn.type = 'button'
+  withIcon(signinBtn, 'github', 'Sign in with GitHub')
   const signinState = el('p', 'muted signin-state')
   void vaultGetSecret('github-token').then((t) => {
     if (t) signinState.textContent = 'Signed in — the stored GitHub token powers PR fetching and Copilot.'
@@ -1277,6 +1340,7 @@ function buildSettingsPanel(): HTMLDivElement {
   const deviceStatus = el('p', 'muted device-status')
   const deviceCancel = el('button', 'btn btn-small', 'Cancel')
   deviceCancel.type = 'button'
+  withIcon(deviceCancel, 'x', 'Cancel')
   /** Bumped per sign-in attempt; a superseded or cancelled flow stops acting on the UI. */
   let signinSeq = 0
   /** Aborts the in-flight token poll when the user cancels the device card. */
@@ -1464,6 +1528,7 @@ function buildSettingsPanel(): HTMLDivElement {
   visionSelect.setAttribute('aria-label', 'Vision model')
   const refreshModelsBtn = el('button', 'btn btn-small catalog-refresh', 'Refresh models')
   refreshModelsBtn.type = 'button'
+  withIcon(refreshModelsBtn, 'refresh-cw', 'Refresh models')
   const catalogHint = el('p', 'muted catalog-hint')
   catalogHint.hidden = true
   catalogHint.setAttribute('role', 'status')
@@ -1708,6 +1773,7 @@ function buildSettingsPanel(): HTMLDivElement {
     if (vaultPrfSupported()) {
       const bio = el('button', 'btn btn-secondary', 'Remember with biometrics')
       bio.type = 'button'
+      withIcon(bio, 'user-check', 'Remember with biometrics')
       bio.addEventListener('click', () => {
         void (async () => {
           bio.disabled = true
@@ -1759,6 +1825,7 @@ function buildSettingsPanel(): HTMLDivElement {
       const play = el('button', 'btn btn-small', 'Play')
       play.type = 'button'
       play.setAttribute('aria-label', `Preview voice ${v.name}`)
+      iconOnly(play, 'volume-2')
       play.addEventListener('click', () => speakVoicePreview(v.name))
       row.appendChild(play)
       voicePreviewList.appendChild(row)
@@ -1868,6 +1935,7 @@ function buildSettingsPanel(): HTMLDivElement {
 
   const wipe = el('button', 'btn btn-danger', 'Wipe All Keys')
   wipe.type = 'button'
+  withIcon(wipe, 'trash-2', 'Wipe All Keys')
   wipe.addEventListener('click', () => {
     if (!window.confirm('Wipe all stored keys? This cannot be undone.')) return
     void (async () => {
@@ -1962,7 +2030,7 @@ function clearDiagramHighlight(): void {
 
 function updateControlStates(state: TtsState): void {
   if (playBtn) {
-    playBtn.textContent = state.paused ? 'Resume' : 'Play'
+    if (playLabelEl) playLabelEl.textContent = state.paused ? 'Resume' : 'Play'
     // While holding for the next section the player stays visually busy.
     playBtn.disabled = (state.playing && !state.paused) || streamHolding
   }
@@ -2088,7 +2156,7 @@ function onTtsChange(state: TtsState): void {
       state.sectionIndex,
       state.sentenceIndex,
     )
-    setStatus('Generating next section…', 'info')
+    setStatus('Generating next section…', 'info', 'loader')
     updateControlStates(state)
     s.prefetch()
     consumeNextStreamSection(s)
@@ -2211,7 +2279,10 @@ export function createDiagramsView(): DiagramsView {
     },
     buildContainer() {
       const details = el('details', 'diagrams')
-      details.appendChild(el('summary', 'diagrams-summary', 'Diagrams'))
+      const summary = el('summary', 'diagrams-summary')
+      summary.appendChild(icon('chevron-down'))
+      summary.appendChild(el('span', undefined, 'Diagrams'))
+      details.appendChild(summary)
       const target = el('div', 'diagrams-body')
       details.appendChild(target)
       body = target
@@ -2320,14 +2391,16 @@ function appendSectionToView(section: TranscriptSection): void {
       const href = fileChipHref(currentRef, currentFileTarget, path)
       let chip: HTMLElement
       if (href !== null) {
-        const a = el('a', 'file-chip', path)
+        const a = el('a', 'file-chip with-icon')
         a.href = href
         a.target = '_blank'
         a.rel = 'noopener'
         chip = a
       } else {
-        chip = el('span', 'file-chip', path)
+        chip = el('span', 'file-chip with-icon')
       }
+      chip.appendChild(icon('file-text'))
+      chip.appendChild(el('span', 'chip-text', path))
       chips.appendChild(chip)
     }
     sec.appendChild(chips)
@@ -2559,23 +2632,27 @@ function buildControls(): HTMLDivElement {
   scrubRow.appendChild(timeLabel)
   controls.appendChild(scrubRow)
 
-  const prevSection = el('button', 'btn btn-icon', '«')
+  const prevSection = el('button', 'btn btn-icon')
   prevSection.type = 'button'
   prevSection.title = 'Previous section'
   prevSection.setAttribute('aria-label', 'Previous section')
+  // No chevron-left in the sprite: flip the right chevron horizontally.
+  iconOnly(prevSection, 'chevron-right').classList.add('icon-flip-x')
   prevSection.addEventListener('click', () => tts.skipSection(-1))
 
-  const prevSentence = el('button', 'btn btn-icon', '‹')
+  const prevSentence = el('button', 'btn btn-icon')
   prevSentence.type = 'button'
   prevSentence.title = 'Previous sentence'
   prevSentence.setAttribute('aria-label', 'Previous sentence')
+  iconOnly(prevSentence, 'skip-back')
   prevSentence.addEventListener('click', () => tts.skip(-1))
 
   // Replay: restart the CURRENT sentence (seek to it, keep speaking).
-  const replayBtn = el('button', 'btn btn-icon', '↻')
+  const replayBtn = el('button', 'btn btn-icon')
   replayBtn.type = 'button'
   replayBtn.title = 'Replay sentence'
   replayBtn.setAttribute('aria-label', 'Replay current sentence')
+  iconOnly(replayBtn, 'rotate-ccw')
   replayBtn.addEventListener('click', () => {
     const st = tts.state()
     if (!st.playing && !st.paused) return
@@ -2586,28 +2663,33 @@ function buildControls(): HTMLDivElement {
   playBtn = el('button', 'btn btn-primary', 'Play')
   playBtn.type = 'button'
   playBtn.disabled = true
+  playLabelEl = withIcon(playBtn, 'play', 'Play')
   playBtn.addEventListener('click', () => tts.play())
 
   pauseBtn = el('button', 'btn', 'Pause')
   pauseBtn.type = 'button'
   pauseBtn.disabled = true
+  withIcon(pauseBtn, 'pause', 'Pause')
   pauseBtn.addEventListener('click', () => tts.pause())
 
   stopBtn = el('button', 'btn', 'Stop')
   stopBtn.type = 'button'
   stopBtn.disabled = true
+  withIcon(stopBtn, 'square', 'Stop')
   stopBtn.addEventListener('click', () => stopPlayback())
 
-  const nextSentence = el('button', 'btn btn-icon', '›')
+  const nextSentence = el('button', 'btn btn-icon')
   nextSentence.type = 'button'
   nextSentence.title = 'Next sentence'
   nextSentence.setAttribute('aria-label', 'Next sentence')
+  iconOnly(nextSentence, 'skip-forward')
   nextSentence.addEventListener('click', () => tts.skip(1))
 
-  const nextSection = el('button', 'btn btn-icon', '»')
+  const nextSection = el('button', 'btn btn-icon')
   nextSection.type = 'button'
   nextSection.title = 'Next section'
   nextSection.setAttribute('aria-label', 'Next section')
+  iconOnly(nextSection, 'chevron-right')
   nextSection.addEventListener('click', () => tts.skipSection(1))
 
   const prefs = readPrefs()
@@ -2659,8 +2741,11 @@ function buildControls(): HTMLDivElement {
     }
     updateSleepLabel()
   })
-  const sleepLabel = el('span', 'sleep-remaining')
-  sleepLabelEl = sleepLabel
+  const sleepLabel = el('span', 'sleep-remaining with-icon')
+  sleepLabel.appendChild(icon('clock'))
+  const sleepLabelText = el('span', undefined)
+  sleepLabel.appendChild(sleepLabelText)
+  sleepLabelEl = sleepLabelText
   if (sleepTickId !== null) {
     window.clearInterval(sleepTickId)
     sleepTickId = null
@@ -2717,7 +2802,10 @@ function buildControls(): HTMLDivElement {
 
 function buildToc(): HTMLDetailsElement {
   const details = el('details', 'toc')
-  details.appendChild(el('summary', 'toc-summary', 'Sections'))
+  const summary = el('summary', 'toc-summary')
+  summary.appendChild(icon('chevron-down'))
+  summary.appendChild(el('span', undefined, 'Sections'))
+  details.appendChild(summary)
   tocListEl = el('ol', 'toc-list')
   details.appendChild(tocListEl)
   tocEl = details
@@ -2769,6 +2857,7 @@ async function refreshQueueList(): Promise<void> {
     const rm = el('button', 'btn btn-small', 'Remove')
     rm.type = 'button'
     rm.setAttribute('aria-label', `Remove ${item.title} from queue`)
+    iconOnly(rm, 'trash-2')
     rm.addEventListener('click', () => {
       if (!store) return
       void store.removeFromQueue(item.ref).then(() => {
@@ -2811,18 +2900,21 @@ function buildTranscriptActions(): HTMLDivElement {
 
   const copy = el('button', 'btn btn-small', 'Copy transcript')
   copy.type = 'button'
+  withIcon(copy, 'copy', 'Copy transcript')
   copy.addEventListener('click', () => {
     void copyTranscript()
   })
 
   const download = el('button', 'btn btn-small', 'Download .txt')
   download.type = 'button'
+  withIcon(download, 'download', 'Download .txt')
   download.addEventListener('click', () => {
     downloadTranscript()
   })
 
   const share = el('button', 'btn btn-small', 'Share')
   share.type = 'button'
+  withIcon(share, 'share', 'Share')
   share.addEventListener('click', () => {
     void shareTranscript()
   })
@@ -2912,13 +3004,20 @@ function showMain(): void {
   const headerActions = el('div', 'header-actions')
 
   // Theme: tri-state cycle auto -> light -> dark, driven by the controller.
-  const themeBtn = el('button', 'btn btn-secondary', 'Theme')
+  // Icon-only (monitor/sun/moon by mode); the accessible name stays on
+  // aria-label, re-set on every swap.
+  const themeBtn = el('button', 'btn btn-secondary btn-icon-only')
   themeBtn.type = 'button'
+  let themeIconEl: SVGSVGElement | null = null
   const syncThemeBtn = (): void => {
     if (!theme) return
     const mode = theme.getMode()
-    themeBtn.textContent = `Theme: ${themeModeLabel(mode)}`
+    const next = icon(themeModeIcon(mode))
+    if (themeIconEl) themeIconEl.replaceWith(next)
+    else themeBtn.appendChild(next)
+    themeIconEl = next
     themeBtn.setAttribute('aria-label', themeModeAria(mode))
+    themeBtn.title = `Theme: ${themeModeLabel(mode)}`
   }
   themeBtn.addEventListener('click', () => {
     if (!theme) return
@@ -2929,8 +3028,10 @@ function showMain(): void {
 
   const settingsBtn = el('button', 'btn btn-secondary', 'Settings')
   settingsBtn.type = 'button'
+  withIcon(settingsBtn, 'sliders', 'Settings')
   const lockBtn = el('button', 'btn btn-secondary', 'Lock')
   lockBtn.type = 'button'
+  withIcon(lockBtn, 'lock', 'Lock')
   lockBtn.addEventListener('click', () => {
     vault.lock() // onLock listener switches to the locked view
   })
@@ -2959,6 +3060,7 @@ function showMain(): void {
     )
     const dismiss = el('button', 'btn btn-small', 'Dismiss')
     dismiss.type = 'button'
+    withIcon(dismiss, 'x', 'Dismiss')
     dismiss.addEventListener('click', () => {
       wlBanner.hidden = true
       lsSet(KEYS.wlDismissed, '1')
@@ -2975,14 +3077,17 @@ function showMain(): void {
   urlInput.setAttribute('aria-label', 'Pull request URL')
   listenBtn = el('button', 'btn btn-primary', 'Listen')
   listenBtn.type = 'submit'
+  withIcon(listenBtn, 'headphones', 'Listen')
   const queueBtn = el('button', 'btn', 'Add to queue')
   queueBtn.type = 'button'
+  withIcon(queueBtn, 'plus', 'Add to queue')
   queueBtn.addEventListener('click', () => {
     void enqueueFromInput(urlInput.value.trim())
   })
   // Demo: bundled transcript, no network, no keys — instant TTS.
   const demoBtn = el('button', 'btn btn-small', 'Try a sample')
   demoBtn.type = 'button'
+  withIcon(demoBtn, 'zap', 'Try a sample')
   demoBtn.addEventListener('click', () => {
     void loadDemo()
   })
@@ -2997,8 +3102,10 @@ function showMain(): void {
   main.appendChild(form)
 
   // Bookmarklet chip: drag to the bookmarks bar, click on any GitHub PR page.
-  const bookmarklet = el('a', 'bookmarklet-chip', 'Click to listen')
+  const bookmarklet = el('a', 'bookmarklet-chip with-icon')
   bookmarklet.href = BOOKMARKLET_HREF
+  bookmarklet.appendChild(icon('bookmark'))
+  bookmarklet.appendChild(el('span', undefined, 'Click to listen'))
   bookmarklet.title =
     'Drag me to your bookmarks bar. On any GitHub pull request page, click the bookmark to listen to it in ListenToPR.'
   bookmarklet.setAttribute('aria-label', 'Click to listen bookmarklet — drag to your bookmarks bar')
@@ -3517,6 +3624,8 @@ function registerServiceWorker(): void {
 function init(): void {
   root = document.getElementById('app')
   if (!root) return
+  // Icon sprite before any view renders, so every icon() <use> resolves.
+  injectSprite(document.body)
   theme = createThemeController()
   theme.apply()
   theme.listen()
