@@ -64,12 +64,27 @@ jobs:
       - name: Generate Android project
         run: bubblewrap update --skipVersionUpgrade --manifest=android/twa-manifest.json --directory=android/dist
 
-      - name: Build signed APK
+      - name: Build unsigned APK (gradle directly; bubblewrap build's stderr buffer overflows)
+        working-directory: android/dist
+        run: ./gradlew --no-daemon -q assembleRelease
+
+      - name: Zipalign and sign APK
         working-directory: android/dist
         env:
-          BUBBLEWRAP_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          BUBBLEWRAP_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: bubblewrap build --skipPwaValidation --manifest=../twa-manifest.json --signingKeyPath=../android.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          BUILD_TOOLS=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
+          UNSIGNED=app/build/outputs/apk/release/app-release-unsigned.apk
+          "$BUILD_TOOLS/zipalign" -f 4 "$UNSIGNED" app-release-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks ../android.keystore \
+            --ks-key-alias listentopr \
+            --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+            --key-pass "pass:$ANDROID_KEY_PASSWORD" \
+            --out app-release-signed.apk \
+            app-release-aligned.apk
+          ls -la app-release-signed.apk
 
       - name: Verify APK signature matches assetlinks
         working-directory: android/dist
